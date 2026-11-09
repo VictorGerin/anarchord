@@ -270,6 +270,27 @@ impl Runtime {
         }
     }
 
+    /// Governança mudou (ex.: ban desfeito): quem já está inscrito no tópico de pedidos não se
+    /// inscreve de novo, então a inscrição de cada um é reavaliada como um pedido novo
+    pub(super) fn recheck_access_subscribers(&mut self, server_id: &str) {
+        if !self.access.subscribed.contains(server_id) || !self.can_issue_passports(server_id, super::now_secs()) {
+            return;
+        }
+        let topic = IdentTopic::new(community::access_topic(server_id)).hash();
+        let subscribers: Vec<String> = self
+            .node
+            .swarm
+            .behaviour()
+            .gossipsub
+            .all_peers()
+            .filter(|(_, topics)| topics.contains(&&topic))
+            .filter_map(|(peer, _)| crate::api::pubkey_hex_from_peer_id(peer))
+            .collect();
+        for pubkey in subscribers {
+            self.note_access_request(server_id, &pubkey, None, false);
+        }
+    }
+
     /// Alguém saiu do tópico de pedidos (recebeu passaporte ou desistiu)
     pub(super) fn on_access_topic_unsubscribed(&mut self, server_id: &str, pubkey: Option<String>) {
         let removed = pubkey.is_some_and(|pk| self.access.pending.get_mut(server_id).is_some_and(|p| p.remove(&pk).is_some()));

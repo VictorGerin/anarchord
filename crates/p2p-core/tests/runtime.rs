@@ -964,6 +964,65 @@ async fn test_private_server_access_request_is_listed_once() {
         .await;
 }
 
+/// Ban desfeito: quem continuou inscrito no tópico de pedidos volta à lista sem pedir de novo
+#[tokio::test]
+async fn test_unbanned_request_is_listed_again() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut alice, alice_task) = start("Alice", None);
+            let alice_port = alice_task.listen_port();
+            tokio::task::spawn_local(alice_task.run());
+            let (mut carol, carol_task) = start("Carol", Some(alice_port));
+            tokio::task::spawn_local(carol_task.run());
+            let CoreEvent::PeerIdentified { pubkey: carol_pk, .. } =
+                alice.wait("Alice identificar Carol", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Carol")).await
+            else {
+                unreachable!()
+            };
+            alice.server(ServerCommand::Create("Clube".into()));
+            let CoreEvent::Server(ServerNotice::Created { id, .. }) =
+                alice.wait("servidor criado", |e| matches!(e, CoreEvent::Server(ServerNotice::Created { .. }))).await
+            else {
+                unreachable!()
+            };
+            alice.server(ServerCommand::Close);
+            alice.wait("servidor privado", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::Closed, .. }))).await;
+
+            carol.server(ServerCommand::Join(id.clone()));
+            let pk = carol_pk.clone();
+            alice
+                .wait("Alice ver Carol na lista", move |e| {
+                    matches!(e, CoreEvent::Server(ServerNotice::AccessRequests { requests, .. }) if requests.iter().any(|r| r.pubkey == pk))
+                })
+                .await;
+
+            alice.server(ServerCommand::Ban { target: carol_pk.clone(), duration: None, reason: String::new() });
+            alice.wait("ban gravado", |e| matches!(e, CoreEvent::Server(ServerNotice::Moderated { .. }))).await;
+            alice
+                .wait("ban aplicado", |e| {
+                    matches!(e, CoreEvent::Server(ServerNotice::ModerationReceived { kind: p2p_core::community::ModKind::Ban { .. }, .. }))
+                })
+                .await;
+            let pk = carol_pk.clone();
+            alice
+                .wait("banida sai da lista", move |e| {
+                    matches!(e, CoreEvent::Server(ServerNotice::AccessRequests { requests, .. }) if !requests.iter().any(|r| r.pubkey == pk))
+                })
+                .await;
+
+            alice.seen.clear();
+            alice.server(ServerCommand::Unban(carol_pk.clone()));
+            let pk = carol_pk.clone();
+            alice
+                .wait("Carol volta à lista depois do unban", move |e| {
+                    matches!(e, CoreEvent::Server(ServerNotice::AccessRequests { requests, .. }) if requests.iter().any(|r| r.pubkey == pk))
+                })
+                .await;
+        })
+        .await;
+}
+
 /// Moderador que fica online depois vê quem está esperando (#91)
 #[tokio::test]
 async fn test_moderator_online_later_sees_pending_request() {

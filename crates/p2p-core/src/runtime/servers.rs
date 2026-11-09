@@ -1175,6 +1175,7 @@ impl Runtime {
             self.enforce_now(topic_server_id);
             // Cadeia ou moderação mudou: quem pede ou quem emite pode ter mudado
             self.sync_access_topics();
+            self.recheck_access_subscribers(topic_server_id);
             if self.active.server_id() == Some(topic_server_id) {
                 self.publish_channel_members();
                 self.emit_access_requests();
