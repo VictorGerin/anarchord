@@ -84,6 +84,9 @@ pub unsafe extern "C" fn p2p_ffi_start_simple(
     config.public_defaults = true;
     // Em mobile, mDNS sem permissão de multicast e sem MulticastLock do Wi-Fi falha o socket UDP
     config.mdns = false;
+    // UPnP só manda o M-SEARCH e recebe resposta unicast: não depende do MulticastLock.
+    // Desligável por `network.upnp` no config.json
+    config.upnp = true;
 
     match FfiEngine::start(config) {
         Ok(engine) => Box::into_raw(Box::new(engine)),

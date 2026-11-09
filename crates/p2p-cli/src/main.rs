@@ -100,6 +100,10 @@ pub struct Args {
 
     pub no_auto_bootstrap: bool,
 
+    /// Não pede ao roteador (UPnP) que encaminhe a porta de escuta
+    #[arg(long, default_value_t = false)]
+    pub no_upnp: bool,
+
 
 
     /// Gravar logs de telemetria e diagnóstico em arquivo (ex: anarchord.log)
@@ -614,6 +618,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         public_defaults: true,
 
         mdns: true,
+
+        upnp: !args.no_upnp,
 
         relay_server: false,
 
@@ -1731,6 +1737,10 @@ mod tests {
 
         let no_enc = Args::parse_from(["p2p-cli", "--no-keystore-encryption"]);
         assert!(no_enc.no_keystore_encryption);
+
+        // UPnP ligado por padrão; --no-upnp desliga (#101)
+        assert!(!custom_args.no_upnp);
+        assert!(Args::parse_from(["p2p-cli", "--no-upnp"]).no_upnp);
 
     }
 

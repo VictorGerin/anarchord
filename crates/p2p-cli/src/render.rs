@@ -212,6 +212,12 @@ fn network(event: &NetworkEvent) -> String {
         NetworkEvent::ConnectionClosed { peer_id, cause } => format!("👋 Conexão fechada com {} ({})", peer_id, cause),
         NetworkEvent::PeerExchange { from, dialed } => format!("🤝 {} par(es) novo(s) indicados por {}", dialed, from),
         NetworkEvent::AudioUnavailable(reason) => format!("⚠️ Áudio nativo indisponível: {}", reason),
+        NetworkEvent::UpnpMapped(addrs) => format!("🔓 UPnP: porta aberta no roteador, alcançável direto em {}", addrs.join(", ")),
+        NetworkEvent::UpnpLost(addrs) => format!("🔒 UPnP: encaminhamento perdido ({}); relay volta se precisar", addrs.join(", ")),
+        NetworkEvent::UpnpUnavailable(reason) => format!("ℹ️ UPnP indisponível: {}. Segue com AutoNAT e relay", reason),
+        NetworkEvent::UpnpUnreachable => {
+            "⚠️ UPnP abriu a porta, mas ninguém de fora conseguiu conectar (firewall do sistema?). Voltando ao relay".to_string()
+        }
     }
 }
 
@@ -659,8 +665,8 @@ fn config_status(cfg: &NodeConfig, used_bytes: u64, envelope_count: usize) -> Ve
             cfg.firewall.friend_chat_per_10s, cfg.firewall.stranger_chat_per_10s, cfg.firewall.friend_control_per_10s, cfg.firewall.stranger_control_per_10s
         ),
         format!(
-            "   network.default_channel = {} | network.auto_bootstrap = {} | network.max_peers = {} | network.listen_port = {}",
-            net.default_channel, net.auto_bootstrap, net.max_peers, net.listen_port
+            "   network.default_channel = {} | network.auto_bootstrap = {} | network.max_peers = {} | network.listen_port = {} | network.upnp = {}",
+            net.default_channel, net.auto_bootstrap, net.max_peers, net.listen_port, net.upnp
         ),
     ]
 }

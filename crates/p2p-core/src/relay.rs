@@ -11,9 +11,13 @@ pub const MAX_RELAY_RESERVATIONS: usize = 2;
 /// `/p2p/<relay>/p2p-circuit` em alguns pares que oferecem o protocolo HOP. Esse endereço
 /// é anunciado (Identify e registros de provedor da DHT), outros nós conectam por ele
 /// e o DCUtR tenta em seguida promover a conexão relayada para uma conexão direta (hole punching).
+///
+/// Com a porta encaminhada por UPnP (#101) o nó é alcançável direto: não reserva circuito, a menos
+/// que o AutoNAT mostre que ninguém de fora consegue discar de volta (firewall do sistema, provedor).
 #[derive(Debug, Default)]
 pub struct RelayManager {
     behind_nat: bool,
+    upnp: UpnpReach,
     /// Pares que oferecem o protocolo HOP -> endereço público direto escolhido para alcançá-los
     candidates: HashMap<PeerId, Multiaddr>,
     /// Reservas pendentes ou aceitas: listener do circuito -> relay
@@ -43,6 +47,39 @@ impl RelayManager {
         self.behind_nat
     }
 
+    /// Liga ou desliga o mapeamento UPnP. Ao ligar, devolve os listeners das reservas atuais para
+    /// o chamador fechar (`remove_listener`); esses relays não contam como falha e voltam a ser
+    /// candidatos se o mapeamento cair.
+    pub fn set_upnp_mapped(&mut self, mapped: bool) -> Vec<ListenerId> {
+        match (mapped, self.upnp) {
+            (true, UpnpReach::Off) => {
+                self.upnp = UpnpReach::Mapped;
+                self.reservations.drain().map(|(listener, _)| listener).collect()
+            }
+            (true, _) => Vec::new(),
+            (false, _) => {
+                self.upnp = UpnpReach::Off;
+                Vec::new()
+            }
+        }
+    }
+
+    /// O AutoNAT não conseguiu discar de volta apesar do mapeamento: volta a reservar relay.
+    /// Retorna `true` só na primeira vez (para avisar a interface uma vez).
+    pub fn upnp_refuted(&mut self) -> bool {
+        if self.upnp == UpnpReach::Mapped {
+            self.upnp = UpnpReach::Refuted;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mapeamento UPnP ativo e não desmentido pelo AutoNAT
+    pub fn upnp_reachable(&self) -> bool {
+        self.upnp == UpnpReach::Mapped
+    }
+
     /// Registra um par que anunciou suporte ao protocolo HOP, guardando um endereço
     /// público direto (TCP ou QUIC) que este nó consegue discar
     pub fn add_candidate(&mut self, peer: PeerId, listen_addrs: &[Multiaddr]) {
@@ -62,7 +99,7 @@ impl RelayManager {
     /// Relays que ainda devem receber pedido de reserva, como endereços de circuito prontos para `listen_on`.
     /// O chamador deve registrar o `ListenerId` retornado por `listen_on` com [`Self::track_reservation`].
     pub fn next_reservations(&self) -> Vec<(PeerId, Multiaddr)> {
-        if !self.behind_nat {
+        if !self.behind_nat || self.upnp_reachable() {
             return Vec::new();
         }
         let reserved: HashSet<&PeerId> = self.reservations.values().collect();
@@ -99,6 +136,18 @@ impl RelayManager {
     }
 }
 
+/// Alcance pelo mapeamento UPnP, do ponto de vista da política de relay
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum UpnpReach {
+    /// Sem mapeamento
+    #[default]
+    Off,
+    /// Porta encaminhada no roteador: dispensa relay
+    Mapped,
+    /// Porta encaminhada, mas o AutoNAT não conseguiu discar de volta: relay de novo
+    Refuted,
+}
+
 /// Endereço direto (não relayado), com IP público ou DNS, sobre TCP ou QUIC puros
 pub(crate) fn is_dialable_addr(addr: &Multiaddr, allow_private: bool) -> bool {
     let mut has_public_host = false;
@@ -122,7 +171,7 @@ pub(crate) fn is_dialable_addr(addr: &Multiaddr, allow_private: bool) -> bool {
         && has_supported_transport
 }
 
-fn is_public_ipv4(ip: &Ipv4Addr) -> bool {
+pub(crate) fn is_public_ipv4(ip: &Ipv4Addr) -> bool {
     let shared_cgnat = ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64;
     !(ip.is_private()
         || ip.is_loopback()
@@ -204,5 +253,51 @@ mod tests {
         assert_eq!(mgr.active_reservations(), 0);
         mgr.add_candidate(relay, &[addr("/ip4/8.8.8.8/tcp/4001")]);
         assert!(mgr.next_reservations().is_empty());
+    }
+
+    #[test]
+    fn test_upnp_mapping_releases_reservations_without_blaming_the_relay() {
+        let mut mgr = RelayManager::new();
+        mgr.set_behind_nat(true);
+        let relay = PeerId::random();
+        mgr.add_candidate(relay, &[addr("/ip4/8.8.8.8/tcp/4001")]);
+        let listener = ListenerId::next();
+        mgr.track_reservation(listener, relay);
+
+        // Porta aberta no roteador: solta a reserva e não pede outra, mesmo atrás de NAT
+        assert_eq!(mgr.set_upnp_mapped(true), vec![listener]);
+        assert_eq!(mgr.active_reservations(), 0);
+        assert!(mgr.next_reservations().is_empty());
+        assert!(mgr.set_upnp_mapped(true).is_empty(), "segundo aviso de mapeamento não solta nada");
+        // O listener solto fecha depois: não marca o relay como falho
+        assert_eq!(mgr.listener_closed(listener), None);
+
+        // Mapeamento perdido: o mesmo relay volta a ser candidato
+        mgr.set_upnp_mapped(false);
+        let next = mgr.next_reservations();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].0, relay);
+    }
+
+    #[test]
+    fn test_autonat_refutes_upnp_once_and_relays_come_back() {
+        let mut mgr = RelayManager::new();
+        mgr.set_behind_nat(true);
+        mgr.add_candidate(PeerId::random(), &[addr("/ip4/8.8.8.8/tcp/4001")]);
+        assert!(!mgr.upnp_refuted(), "sem mapeamento não há o que desmentir");
+
+        mgr.set_upnp_mapped(true);
+        assert!(mgr.upnp_reachable());
+        assert!(mgr.upnp_refuted());
+        assert!(!mgr.upnp_refuted(), "desmentido avisa uma vez só");
+        assert!(!mgr.upnp_reachable());
+        assert_eq!(mgr.next_reservations().len(), 1);
+
+        // Mapeamento renovado não apaga o desmentido; perder e remapear dá nova chance
+        mgr.set_upnp_mapped(true);
+        assert!(!mgr.upnp_reachable());
+        mgr.set_upnp_mapped(false);
+        mgr.set_upnp_mapped(true);
+        assert!(mgr.upnp_reachable());
     }
 }

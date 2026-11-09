@@ -17,6 +17,7 @@ mod files;
 mod network;
 mod screen;
 mod servers;
+mod upnp;
 mod voice;
 
 pub use chat::ActiveChannel;
@@ -79,6 +80,9 @@ pub struct CoreConfig {
     pub public_defaults: bool,
     /// Descoberta na rede local (mDNS)
     pub mdns: bool,
+    /// Pede ao roteador (UPnP) que encaminhe a porta de escuta (#101). Também desligável por
+    /// `network.upnp` no `config.json`
+    pub upnp: bool,
     /// Atende como servidor de relay (nós públicos)
     pub relay_server: bool,
     /// Rede de laboratório: IPs privados valem como públicos e as sondagens são rápidas
@@ -112,6 +116,7 @@ impl CoreConfig {
             trackers: Vec::new(),
             public_defaults: false,
             mdns: false,
+            upnp: false,
             relay_server: false,
             lab: false,
             sniff_file: None,
@@ -240,6 +245,9 @@ pub(crate) struct Runtime {
     relay_manager: RelayManager,
     discovery: discovery::DiscoveryState,
     tracker_rx: Option<UnboundedReceiver<String>>,
+    /// Mapeamento de porta no roteador (UPnP) e os endereços externos que ele confirmou
+    upnp: Option<crate::upnp::UpnpHandle>,
+    upnp_addrs: HashSet<Multiaddr>,
 
     // Chat e servidores
     active: ActiveChannel,
@@ -334,6 +342,8 @@ impl Runtime {
             relay_manager,
             discovery: discovery::DiscoveryState::new(config.lab),
             tracker_rx: None,
+            upnp: None,
+            upnp_addrs: HashSet::new(),
             active,
             servers,
             mls,
@@ -391,6 +401,7 @@ impl Runtime {
         self.subscribe_peer_exchange();
         self.init_dm_and_mailbox();
         self.start_discovery();
+        let mut upnp_rx = self.start_upnp();
         self.start_voice();
         self.start_synthetic_video();
         self.publish_servers();
@@ -430,6 +441,7 @@ impl Runtime {
                 Some(()) = recv(&mut fs_events_rx) => self.on_fs_watch_event(),
                 Some(result) = recv(&mut stamp_rx) => self.on_stamp_result(result),
                 Some(result) = recv(&mut pow_rx) => self.on_pow_result(result),
+                Some(event) = recv(&mut upnp_rx) => self.on_upnp_event(event),
             }
             // O grupo da sala nasce, chega ou some em vários caminhos (Welcome, Commit, troca de sala,
             // anúncio de grupo vencedor...): conferir aqui cobre todos
@@ -446,6 +458,10 @@ impl Runtime {
             }
         })
         .await;
+        // Tira o encaminhamento de porta do roteador (sem isso ele ficaria até o lease vencer)
+        if let Some(upnp) = self.upnp.take() {
+            upnp.shutdown().await;
+        }
         self.stop_discovery();
         self.emit(CoreEvent::Stopped);
     }
