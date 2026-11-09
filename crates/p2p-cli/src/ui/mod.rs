@@ -20,6 +20,7 @@ use ratatui::{
 };
 use std::collections::{HashMap, HashSet};
 use editor::LineEditor;
+use p2p_core::runtime::RoomKeyStatus;
 use menu::{
     bans_menu, channel_command, channel_menu, files_menu, main_menu, member_menu, spaces_menu,
     BanUiEntry, FileUiEntry, FileUiState, FriendUiEntry, Menu, MenuAction, MenuContext,
@@ -60,6 +61,8 @@ pub enum UiEvent {
     },
     /// Servidores conhecidos (para o menu "Trocar de espaço")
     ServersChanged(Vec<ServerEntry>),
+    /// A sala atual ganhou ou perdeu a chave do grupo cifrado (ícone 🔐 no cabeçalho)
+    RoomKey(RoomKeyStatus),
     /// Pedidos de acesso pendentes do servidor atual: (nick, pubkey)
     AccessRequests(Vec<(String, String)>),
     /// Amigos conhecidos e seu status online/offline
@@ -161,6 +164,8 @@ pub struct TerminalUi {
     /// Arquivos conhecidos (oferecidos, baixando e compartilhando) para o popup `/files` e autocompletar `Tab`
     known_files: Vec<FileUiEntry>,
     in_server: bool,
+    /// Chave do grupo cifrado da sala atual (só vale dentro de servidor)
+    room_key: RoomKeyStatus,
     chat_area: Rect,
     /// Largura do rótulo da aba Chat no título (para saber em qual aba o clique caiu)
     tab_split: u16,
@@ -222,6 +227,7 @@ impl TerminalUi {
             friends: Vec::new(),
             known_files: Vec::new(),
             in_server: false,
+            room_key: RoomKeyStatus::Unencrypted,
             chat_area: Rect::default(),
             tab_split: 0,
             header_row: u16::MAX,
@@ -386,6 +392,9 @@ impl TerminalUi {
             }
             UiEvent::ServersChanged(servers) => {
                 self.servers = servers;
+            }
+            UiEvent::RoomKey(status) => {
+                self.room_key = status;
             }
             UiEvent::AccessRequests(requests) => {
                 self.access_requests = requests;
@@ -946,13 +955,21 @@ impl TerminalUi {
         };
 
         let chan_prefix = if self.current_channel.starts_with('@') { "" } else { "#" };
-        let spans = vec![
+        let mut spans = vec![
             Span::styled("⚡ ANARCHORD P2P ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled(format!("| Usuário: {} ", self.my_nick), Style::default().fg(Color::Cyan)),
             Span::styled(format!("| Chave: {}... ", &self.my_pubkey[..8]), Style::default().fg(Color::DarkGray)),
             Span::styled(format!("| {} {}{} ", self.space_name, chan_prefix, self.current_channel), Style::default().fg(Color::Green)),
-            Span::styled(format!("| {}", muted_str), Style::default().fg(Color::Magenta)),
+            Span::styled(format!("| {} ", muted_str), Style::default().fg(Color::Magenta)),
         ];
+        // Depois do MIC, para não mexer nas áreas clicáveis (índices 3 e 4)
+        match (self.in_server, self.room_key) {
+            (true, RoomKeyStatus::Ready) => {
+                spans.push(Span::styled("| 🔐 cifrado", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)))
+            }
+            (true, _) => spans.push(Span::styled("| ⏳ aguardando chave", Style::default().fg(Color::Yellow))),
+            (false, _) => {}
+        }
         // Guarda onde ficaram o espaço (abre a troca Lobby/servidores) e o MIC (liga/desliga)
         let mut col = chunks[0].x + 1;
         let ranges: Vec<(u16, u16)> = spans
@@ -1388,6 +1405,8 @@ mod tests {
             .replace("💚  ", "💚 ")
             .replace("📬  ", "📬 ")
             .replace("🔒  ", "🔒 ")
+            .replace("🔐  ", "🔐 ")
+            .replace("⏳  ", "⏳ ")
     }
 
     fn bob_connected() -> UiEvent {
@@ -1508,6 +1527,60 @@ mod tests {
 
         ui.handle_event(UiEvent::VoiceChannelChanged(Some("voz".to_string())));
         assert!(render(&mut ui).contains("▶ 🔊 voz"));
+    }
+
+    /// Linha do cabeçalho (a de dentro da borda)
+    fn header_line(ui: &mut TerminalUi) -> String {
+        render(ui).lines().nth(1).unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn test_header_shows_encryption_state_of_current_room() {
+        let mut ui = ui_for("Alice");
+        // Lobby: nada cifrado, nada no cabeçalho
+        let header = header_line(&mut ui);
+        assert!(!header.contains("🔐") && !header.contains("aguardando chave"), "{}", header);
+
+        // Entrou no servidor, a chave ainda não chegou
+        ui.handle_event(UiEvent::SpaceChanged { space_name: "🏰 Rust Guild".into(), channels: vec![("geral".into(), false)], is_server: true });
+        ui.handle_event(UiEvent::RoomKey(RoomKeyStatus::Waiting));
+        let header = header_line(&mut ui);
+        assert!(header.contains("⏳ aguardando chave"), "{}", header);
+        assert!(!header.contains("🔐"), "{}", header);
+
+        // Welcome recebido: cifrado
+        ui.handle_event(UiEvent::RoomKey(RoomKeyStatus::Ready));
+        let header = header_line(&mut ui);
+        assert!(header.contains("🔐 cifrado"), "{}", header);
+        assert!(!header.contains("aguardando chave"), "{}", header);
+
+        // Perdeu o grupo (removido ou fora de sincronia): volta o aviso
+        ui.handle_event(UiEvent::RoomKey(RoomKeyStatus::Waiting));
+        assert!(header_line(&mut ui).contains("⏳ aguardando chave"));
+
+        // De volta ao Lobby: o ícone some
+        ui.handle_event(UiEvent::RoomKey(RoomKeyStatus::Ready));
+        ui.handle_event(UiEvent::SpaceChanged { space_name: "🌐 Lobby".into(), channels: vec![], is_server: false });
+        ui.handle_event(UiEvent::RoomKey(RoomKeyStatus::Unencrypted));
+        let header = header_line(&mut ui);
+        assert!(!header.contains("🔐") && !header.contains("aguardando chave"), "{}", header);
+    }
+
+    #[test]
+    fn test_encryption_icon_keeps_header_click_areas() {
+        let mut ui = ui_for("Alice");
+        ui.handle_event(UiEvent::SpaceChanged { space_name: "🏰 Rust Guild".into(), channels: vec![("geral".into(), false)], is_server: true });
+        ui.handle_event(UiEvent::RoomKey(RoomKeyStatus::Ready));
+        render(&mut ui);
+        let click_at = |ui: &mut TerminalUi, col: u16| {
+            let row = ui.header_row;
+            ui.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: col, row, modifiers: KeyModifiers::NONE })
+        };
+        // O MIC continua clicável e o ícone (logo depois dele) não faz nada
+        let (mic_start, mic_end) = ui.header_mic_cols;
+        assert!(click_at(&mut ui, mic_start + 3).iter().any(|a| matches!(a, UiAction::ToggleMute)));
+        assert!(click_at(&mut ui, mic_end + 3).is_empty());
+        assert!(ui.overlay.is_none());
     }
 
     #[test]

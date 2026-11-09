@@ -246,6 +246,8 @@ pub(crate) struct Runtime {
     servers: ServerRegistry,
     mls: ServerGroups,
     last_key_package: HashMap<String, std::time::Instant>,
+    /// Último estado da chave da sala enviado à interface (`None` = ainda não enviado)
+    room_key: Option<RoomKeyStatus>,
     /// Último pedido de carimbo de cada evento da fila (para pedir de novo se nada chegar)
     outbox_retry: HashMap<String, std::time::Instant>,
     /// Alterações deste nó aguardando carimbo: o aviso sai quando forem aplicadas
@@ -336,6 +338,7 @@ impl Runtime {
             servers,
             mls,
             last_key_package: HashMap::new(),
+            room_key: None,
             outbox_retry: HashMap::new(),
             pending_changes: HashMap::new(),
             pending_transfer_offer: None,
@@ -428,6 +431,9 @@ impl Runtime {
                 Some(result) = recv(&mut stamp_rx) => self.on_stamp_result(result),
                 Some(result) = recv(&mut pow_rx) => self.on_pow_result(result),
             }
+            // O grupo da sala nasce, chega ou some em vários caminhos (Welcome, Commit, troca de sala,
+            // anúncio de grupo vencedor...): conferir aqui cobre todos
+            self.sync_room_key();
         }
 
         // Avisa o grupo cifrado da sala que saímos e dá um instante para a rede enviar (Ctrl+C não

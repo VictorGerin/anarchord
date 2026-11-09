@@ -2,7 +2,7 @@
 //! grupo cifrado (MLS).
 
 use super::{
-    BanEntry, ChannelInfo, CoreError, CoreEvent, Role, Runtime, ServerChange, ServerCommand, ServerInfo, ServerListEntry, ServerNotice,
+    BanEntry, ChannelInfo, CoreError, CoreEvent, Role, RoomKeyStatus, Runtime, ServerChange, ServerCommand, ServerInfo, ServerListEntry, ServerNotice,
 };
 use crate::api::ChatMessage;
 use crate::community::{
@@ -121,6 +121,19 @@ impl Runtime {
         if !self.request_group_key(&server_id, &channel) {
             let _ = self.mls.create_group(&room);
             self.announce_mls_group();
+        }
+    }
+
+    /// Avisa a interface quando a sala atual passa a ter (ou deixa de ter) a chave do grupo cifrado
+    pub(super) fn sync_room_key(&mut self) {
+        let status = match self.active_room() {
+            None => RoomKeyStatus::Unencrypted,
+            Some((_, _, room)) if self.mls.has_group(&room) => RoomKeyStatus::Ready,
+            Some(_) => RoomKeyStatus::Waiting,
+        };
+        if self.room_key != Some(status) {
+            self.room_key = Some(status);
+            self.emit(CoreEvent::RoomKey(status));
         }
     }
 

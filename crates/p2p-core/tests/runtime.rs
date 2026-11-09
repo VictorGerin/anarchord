@@ -2,7 +2,7 @@
 //! interface faria: Lobby, servidor, convite, grupo cifrado, moderação e histórico.
 
 use p2p_core::runtime::{
-    Core, CoreCommand, CoreConfig, CoreError, CoreEvent, CoreHandle, ServerChange, ServerCommand, ServerNotice, SpaceInfo,
+    Core, CoreCommand, CoreConfig, CoreError, CoreEvent, CoreHandle, RoomKeyStatus, ServerChange, ServerCommand, ServerNotice, SpaceInfo,
 };
 use p2p_core::UserIdentity;
 use std::path::PathBuf;
@@ -41,6 +41,23 @@ impl Peer {
         })
         .await;
         result.unwrap_or_else(|_| panic!("tempo esgotado esperando: {}. Eventos vistos:\n{:#?}", what, self.seen))
+    }
+
+    /// Como `wait`, mas só vale evento que chegou depois da posição `from` de `seen`
+    async fn wait_after(&mut self, from: usize, what: &str, pred: impl Fn(&CoreEvent) -> bool) -> CoreEvent {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(found) = self.seen.iter().skip(from).find(|e| pred(e)) {
+                return found.clone();
+            }
+            assert!(start.elapsed() < TIMEOUT, "tempo esgotado esperando: {}. Eventos vistos:\n{:#?}", what, &self.seen[from..]);
+            self.drain(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Estados da chave da sala enviados até agora, em ordem
+    fn room_keys(&self) -> Vec<RoomKeyStatus> {
+        self.seen.iter().filter_map(|e| match e { CoreEvent::RoomKey(s) => Some(*s), _ => None }).collect()
     }
 
     /// Lê o que chegar por `duration`
@@ -126,9 +143,13 @@ async fn test_two_cores_server_lifecycle() {
             };
             let in_server = |id: String| move |e: &CoreEvent| matches!(e, CoreEvent::ChannelEntered { space: SpaceInfo::Server { id: sid, .. }, .. } if *sid == id);
             alice.wait("Alice entrar no servidor", in_server(id.clone())).await;
+            // Sozinha na sala, Alice cria o grupo cifrado: a interface recebe a chave pronta
+            alice.wait("Alice com a chave da sala", |e| matches!(e, CoreEvent::RoomKey(RoomKeyStatus::Ready))).await;
+            let ready_at = alice.seen.len();
 
             // Convite no Lobby #geral: os dois precisam estar lá (o canal de teste é outro)
             alice.send(CoreCommand::Server(ServerCommand::Switch("lobby".into())));
+            alice.wait_after(ready_at, "Lobby sem cifra", |e| matches!(e, CoreEvent::RoomKey(RoomKeyStatus::Unencrypted))).await;
             bob.send(CoreCommand::JoinChannel("geral".into()));
             alice.send(CoreCommand::JoinChannel("geral".into()));
             bob.wait("Bob ver Alice em #geral", |e| matches!(e, CoreEvent::ChannelMembers { channel, members } if channel == "geral" && members.iter().any(|m| m == "Alice"))).await;
@@ -149,6 +170,13 @@ async fn test_two_cores_server_lifecycle() {
             bob.server(ServerCommand::Accept);
             bob.wait("Bob entrar no servidor", in_server(id.clone())).await;
             bob.wait("Bob receber a chave do grupo", |e| matches!(e, CoreEvent::Server(ServerNotice::KeyReceived { .. }))).await;
+            // A interface viu o aviso de espera antes do Welcome e o 🔐 depois dele
+            bob.wait("sala de Bob cifrada", |e| matches!(e, CoreEvent::RoomKey(RoomKeyStatus::Ready))).await;
+            let keys = bob.room_keys();
+            assert_eq!(keys.first(), Some(&RoomKeyStatus::Unencrypted), "{:?}", keys);
+            let waiting = keys.iter().position(|k| *k == RoomKeyStatus::Waiting).expect("aviso de espera pela chave");
+            assert!(keys[waiting..].contains(&RoomKeyStatus::Ready), "{:?}", keys);
+            assert!(keys.windows(2).all(|w| w[0] != w[1]), "só emite quando muda: {:?}", keys);
 
             // Chat do servidor (cifrado de ponta a ponta); repete até a malha do tópico se formar
             let mut received = false;
@@ -231,6 +259,8 @@ async fn test_two_cores_server_lifecycle() {
 
             // A manutenção da dona tira Bob do grupo cifrado; depois disso ele não lê mais nada
             bob.wait("Bob sair do grupo cifrado", |e| matches!(e, CoreEvent::Server(ServerNotice::RemovedFromGroup { .. }))).await;
+            let removed_at = bob.seen.iter().position(|e| matches!(e, CoreEvent::Server(ServerNotice::RemovedFromGroup { .. }))).unwrap();
+            bob.wait_after(removed_at, "Bob perder o 🔐", |e| matches!(e, CoreEvent::RoomKey(RoomKeyStatus::Waiting))).await;
             for _ in 0..4 {
                 alice.send(CoreCommand::SendMessage("depois do ban".into()));
                 bob.drain(Duration::from_millis(500)).await;

@@ -863,6 +863,7 @@ fn ui_events(event: &CoreEvent) -> Vec<UiEvent> {
 
         }),
 
+        CoreEvent::RoomKey(status) => out.push(UiEvent::RoomKey(*status)),
         CoreEvent::Server(ServerNotice::AccessRequests { requests, .. }) => {
             out.push(UiEvent::AccessRequests(requests.iter().map(|r| (r.nick.clone(), r.pubkey.clone())).collect()))
         }

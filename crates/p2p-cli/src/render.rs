@@ -97,7 +97,7 @@ pub fn describe(event: &CoreEvent) -> Vec<String> {
         CoreEvent::AudioDevices { inputs, outputs } => {
             vec![format!("🎤 Entradas: {}", inputs.join(" | ")), format!("🔊 Saídas: {}", outputs.join(" | "))]
         }
-        CoreEvent::SpaceChanged { .. } | CoreEvent::ServersChanged(_) | CoreEvent::ChannelMembers { .. } => Vec::new(),
+        CoreEvent::SpaceChanged { .. } | CoreEvent::ServersChanged(_) | CoreEvent::ChannelMembers { .. } | CoreEvent::RoomKey(_) => Vec::new(),
         CoreEvent::ChannelEntered { space, channel } => one(format!("🚀 {} #{}", space_label(space), channel)),
         CoreEvent::ChatMessage { .. } | CoreEvent::EncryptedMessage { .. } => Vec::new(),
         CoreEvent::InviteReceived { from, known: false, .. } => one(format!("💡 Convite de {}: digite /server accept para entrar", from)),

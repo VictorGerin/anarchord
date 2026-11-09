@@ -36,6 +36,8 @@ pub enum CoreEvent {
     /// Espaço atual (Lobby ou servidor) e os canais dele
     SpaceChanged { space: SpaceInfo, channels: Vec<ChannelInfo> },
     ServersChanged(Vec<ServerSummary>),
+    /// Estado da chave do grupo cifrado (MLS) da sala atual; emitido só quando muda
+    RoomKey(RoomKeyStatus),
     ChannelEntered { space: SpaceInfo, channel: String },
     /// Pares Anarchord inscritos no canal de texto atual
     ChannelMembers { channel: String, members: Vec<String> },
@@ -174,6 +176,17 @@ pub enum SpaceInfo {
     Lobby,
     /// `name` é `None` enquanto a configuração do servidor não chegou
     Server { id: String, name: Option<String> },
+}
+
+/// Se a sala atual é cifrada e se a chave do grupo MLS já chegou
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoomKeyStatus {
+    /// Lobby: nada é cifrado de ponta a ponta
+    Unencrypted,
+    /// Sala de servidor ainda sem a chave do grupo (Welcome a caminho, sem passaporte ou fora de sincronia)
+    Waiting,
+    /// Sala de servidor com a chave do grupo: mensagens cifradas de ponta a ponta
+    Ready,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
