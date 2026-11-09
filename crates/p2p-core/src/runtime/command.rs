@@ -116,5 +116,13 @@ pub enum ServerCommand {
     ShowPassport,
     /// Solicita o achatamento de cadeia do passaporte local caso haja autoridade superior online
     FlattenPassport,
+    /// Corrente de chaves do servidor: raiz em vigor, validade e transferências (#99)
+    KeyShow,
+    /// Renova a validade da Chave do Servidor (quem a tem)
+    KeyRenew,
+    /// Propõe transferir a Chave do Servidor a um par (nick ou pubkey)
+    KeyTransfer(String),
+    /// Aceita a última proposta de transferência recebida
+    KeyAccept,
     Help,
 }

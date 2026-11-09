@@ -14,11 +14,13 @@ pub mod access_proof;
 pub mod cert;
 pub mod chain;
 pub mod e2ee;
+pub mod keychain;
 pub mod passport;
 pub mod timestamp;
 
 pub use cert::{format_duration, parse_duration, ModKind, UtcSecs};
 pub use chain::{AddResult, BanState, Channel, ChannelType, Entry, Genesis, GovEvent, Rejection, ServerChain, ServerState};
+pub use keychain::{KeyLink, KeyLinkBody, KeyLinkKind, RootKey};
 pub use passport::{PassportError, PassportPermission, ServerPassport};
 pub use timestamp::{PeerTimestampToken, TimestampAttestation, TimestampPolicy, TrustedTsa};
 
@@ -160,6 +162,9 @@ pub enum ServerMessage {
         #[serde(default)]
         genesis: Option<Genesis>,
         events: Vec<GovEvent>,
+        /// Elos da corrente de chaves (#99)
+        #[serde(default)]
+        keys: Vec<KeyLink>,
     },
     /// Inventário de quem publica: quem tiver o que falta responde com `Events`.
     /// Em servidor privado só é atendido com passaporte.
@@ -233,6 +238,24 @@ pub enum ServerMessage {
     /// Resposta a pedido sem prova válida num servidor que a exige: a dificuldade e as autoridades
     /// de tempo aceitas (quem pede ainda não tem o registro para saber)
     AccessPolicy { server_id: String, pow_bits: u8, tsas: Vec<TrustedTsa> },
+    /// Quem tem a Chave do Servidor propõe transferi-la a `target` (identidade pessoal). Quem recebe
+    /// aceita gerando a chave nova na própria máquina.
+    KeyTransferOffer {
+        server_id: String,
+        target: String,
+        /// Identidade pessoal de quem entrega (sai da lista de protegidos)
+        previous_owner: String,
+        /// Chave em vigor e último elo aceito da corrente de chaves
+        key: String,
+        previous: String,
+    },
+    /// Aceitação: o corpo do elo de transferência assinado pela chave nova
+    KeyTransferAccept {
+        server_id: String,
+        body: KeyLinkBody,
+        #[serde(with = "crate::b64")]
+        new_key_signature: Vec<u8>,
+    },
     /// Pedido de carimbo de tempo a testemunhas da rede (só o hash viaja)
     StampRequest { server_id: String, imprint: String, nonce: String },
     /// Carimbo sobre `imprint` (de uma TSA ou de uma testemunha) para anexar ao objeto correspondente
@@ -275,6 +298,8 @@ pub enum CommunityError {
     InvalidTsa(String),
     #[error("Nada a consolidar")]
     NothingToConsolidate,
+    #[error("Transferência inválida: {0}")]
+    InvalidTransfer(String),
     #[error("{0}")]
     Identity(#[from] crate::identity::IdentityError),
     #[error("Erro de E/S: {0}")]
@@ -313,6 +338,8 @@ pub struct KnownServer {
     /// Passaportes que os outros participantes apresentaram (por titular). Só em memória: cada
     /// passaporte fica guardado em disco apenas com o próprio titular, que o reapresenta ao voltar.
     passports: BTreeMap<String, ServerPassport>,
+    /// Elos da corrente de chaves deste nó aguardando carimbo de TSA (por id)
+    key_outbox: BTreeMap<String, KeyLink>,
     /// Eventos deste nó aguardando carimbo (por id)
     outbox: BTreeMap<String, GovEvent>,
     /// Ids de eventos já avaliados e descartados (não são pedidos de novo)
@@ -329,6 +356,7 @@ impl KnownServer {
             my_passport: None,
             passports: BTreeMap::new(),
             outbox: BTreeMap::new(),
+            key_outbox: BTreeMap::new(),
             discarded: BTreeSet::new(),
         }
     }
@@ -576,13 +604,34 @@ impl KnownServer {
                 outcome.changed = true;
             }
         }
+        // Elos da corrente de chaves: entram (e são publicados) quando a posse os aceita
+        let key_ids: Vec<String> = self.key_outbox.iter().filter(|(_, l)| &l.imprint() == imprint).map(|(id, _)| id.clone()).collect();
+        for id in key_ids {
+            let link = self.key_outbox.get_mut(&id).expect("listado acima");
+            if !link.add_stamp(stamp.clone()) {
+                continue;
+            }
+            outcome.changed = true;
+            let link = link.clone();
+            self.chain.add_key_links(vec![link.clone()]);
+            if self.chain.key_link_accepted(&id) {
+                self.key_outbox.remove(&id);
+                outcome.ready_keys.push(link);
+            }
+        }
+        let known_link = self.chain.key_links().find(|l| &l.imprint() == imprint && !l.stamps.contains(stamp)).cloned();
+        if let Some(mut link) = known_link {
+            link.add_stamp(stamp.clone());
+            self.chain.add_key_links(vec![link]);
+            outcome.changed = true;
+        }
         if let Some(mine) = self.my_passport.as_mut() {
             outcome.changed |= mine.add_stamp_to_link(imprint, stamp);
         }
         for passport in self.passports.values_mut() {
             outcome.changed |= passport.add_stamp_to_link(imprint, stamp);
         }
-        if !outcome.ready.is_empty() {
+        if !outcome.ready.is_empty() || !outcome.ready_keys.is_empty() {
             self.refresh_owner_key();
         }
         outcome
@@ -592,15 +641,23 @@ impl KnownServer {
     fn sync_messages(&self, with_genesis: bool, have: &BTreeSet<String>) -> Vec<ServerMessage> {
         let events = self.chain.missing_for(have);
         let genesis = with_genesis.then(|| self.chain.genesis().cloned()).flatten();
+        // A corrente de chaves é pequena: vai inteira (o que falta) na primeira mensagem
+        let keys: Vec<KeyLink> = self.chain.key_links().filter(|l| !have.contains(&l.id())).cloned().collect();
         if events.is_empty() {
-            return genesis
-                .map(|g| vec![ServerMessage::Events { server_id: self.server_id.clone(), genesis: Some(g), events: Vec::new() }])
-                .unwrap_or_default();
+            if genesis.is_none() && keys.is_empty() {
+                return Vec::new();
+            }
+            return vec![ServerMessage::Events { server_id: self.server_id.clone(), genesis, events: Vec::new(), keys }];
         }
-        let mut genesis = genesis;
+        let (mut genesis, mut keys) = (genesis, Some(keys));
         events
             .chunks(EVENTS_PER_MESSAGE)
-            .map(|chunk| ServerMessage::Events { server_id: self.server_id.clone(), genesis: genesis.take(), events: chunk.to_vec() })
+            .map(|chunk| ServerMessage::Events {
+                server_id: self.server_id.clone(),
+                genesis: genesis.take(),
+                events: chunk.to_vec(),
+                keys: keys.take().unwrap_or_default(),
+            })
             .collect()
     }
 
@@ -622,6 +679,7 @@ impl KnownServer {
 struct StampOutcome {
     changed: bool,
     ready: Vec<GovEvent>,
+    ready_keys: Vec<KeyLink>,
     rejected: Vec<(Entry, Rejection)>,
 }
 
@@ -638,6 +696,8 @@ pub enum ServerEvent {
     Reply { server_id: String, messages: Vec<ServerMessage> },
     /// Carimbo anexado a algo que este nó guarda
     StampAttached { server_id: String },
+    /// A corrente de chaves mudou (renovação ou transferência da Chave do Servidor)
+    OwnershipChanged { server_id: String },
     /// Mensagem descartada (inválida, antiga ou de servidor que não acompanhamos)
     Ignored(String),
 }
@@ -653,6 +713,11 @@ struct StoredServer {
     events: Vec<StoredEvent>,
     #[serde(default)]
     outbox: Vec<StoredEvent>,
+    /// Corrente de chaves (todos os elos conhecidos) e os deste nó aguardando carimbo
+    #[serde(default)]
+    keys: Vec<KeyLink>,
+    #[serde(default)]
+    key_outbox: Vec<KeyLink>,
     /// Passaportes usados pelos eventos acima, uma vez cada (por hash). Nenhum outro passaporte de
     /// terceiros é guardado.
     #[serde(default)]
@@ -755,6 +820,7 @@ impl ServerRegistry {
             let mut server = KnownServer::new(id);
             if let Some(genesis) = stored.genesis {
                 if server.chain.set_genesis(genesis) {
+                    server.chain.add_key_links(stored.keys);
                     let table = &stored.event_passports;
                     let events: Vec<GovEvent> = stored.base.into_iter().chain(stored.events).filter_map(|e| e.restore(table)).collect();
                     server.chain.add_events(events, now);
@@ -763,6 +829,11 @@ impl ServerRegistry {
             for event in stored.outbox.into_iter().filter_map(|e| e.restore(&stored.event_passports)) {
                 if event.verify_signature(id) {
                     server.outbox.insert(event.id(), event);
+                }
+            }
+            for link in stored.key_outbox {
+                if link.verify_signatures(id) {
+                    server.key_outbox.insert(link.id(), link);
                 }
             }
             server.stored_keys = load_server_keys(&dir, id)?;
@@ -944,7 +1015,7 @@ impl ServerRegistry {
     /// usado para não entregar o registro de um servidor privado a quem está fora dele.
     pub fn handle_message(&mut self, message: ServerMessage, from_pubkey: Option<&str>, now: UtcSecs) -> Vec<ServerEvent> {
         match message {
-            ServerMessage::Events { server_id, genesis, events } => self.receive_events(&server_id, genesis, events, now),
+            ServerMessage::Events { server_id, genesis, events, keys } => self.receive_events(&server_id, genesis, events, keys, now),
             ServerMessage::Inventory { server_id, has_genesis, have, passport } => {
                 let Some(server) = self.servers.get_mut(&server_id).filter(|s| s.has_chain()) else {
                     return vec![ServerEvent::Ignored("sem registro para responder".into())];
@@ -982,13 +1053,15 @@ impl ServerRegistry {
             | ServerMessage::AccessRequest { .. }
             | ServerMessage::AccessPolicy { .. }
             | ServerMessage::GroupLeave { .. }
+            | ServerMessage::KeyTransferOffer { .. }
+            | ServerMessage::KeyTransferAccept { .. }
             | ServerMessage::StampRequest { .. } => {
                 vec![ServerEvent::Ignored("mensagem do grupo cifrado, passaporte ou carimbo (tratada pelo runtime)".into())]
             }
         }
     }
 
-    fn receive_events(&mut self, server_id: &str, genesis: Option<Genesis>, events: Vec<GovEvent>, now: UtcSecs) -> Vec<ServerEvent> {
+    fn receive_events(&mut self, server_id: &str, genesis: Option<Genesis>, events: Vec<GovEvent>, keys: Vec<KeyLink>, now: UtcSecs) -> Vec<ServerEvent> {
         let Some(server) = self.servers.get_mut(server_id) else {
             return vec![ServerEvent::Ignored("servidor não acompanhado".into())];
         };
@@ -999,6 +1072,15 @@ impl ServerRegistry {
         }
         if !server.has_chain() {
             return vec![ServerEvent::Ignored("eventos sem a Genesis".into())];
+        }
+        // Posse primeiro: os eventos são validados contra as raízes resolvidas
+        if !keys.is_empty() {
+            let before = server.chain.ownership().clone();
+            server.chain.add_key_links(keys);
+            if *server.chain.ownership() != before {
+                changed = true;
+                out.push(ServerEvent::OwnershipChanged { server_id: server_id.to_string() });
+            }
         }
         for (event, result) in server.chain.add_events(events, now) {
             match result {
@@ -1152,6 +1234,11 @@ impl ServerRegistry {
             let messages = outcome.ready.chunks(EVENTS_PER_MESSAGE).map(|c| events_message(server_id, c.to_vec())).collect();
             out.push(ServerEvent::Reply { server_id: server_id.to_string(), messages });
         }
+        if !outcome.ready_keys.is_empty() {
+            out.push(ServerEvent::OwnershipChanged { server_id: server_id.to_string() });
+            let message = ServerMessage::Events { server_id: server_id.to_string(), genesis: None, events: Vec::new(), keys: outcome.ready_keys };
+            out.push(ServerEvent::Reply { server_id: server_id.to_string(), messages: vec![message] });
+        }
         if outcome.changed {
             let _ = self.persist(server_id);
             out.push(ServerEvent::StampAttached { server_id: server_id.to_string() });
@@ -1281,27 +1368,105 @@ impl ServerRegistry {
         self.submit(server_id, personal, Entry::Consolidate(Box::new(consolidation)), now)
     }
 
-    /// Assinatura de quem recebe a Chave do Servidor, aceitando a transferência. Feita na máquina
-    /// de quem recebe: a chave nova nunca sai dela.
-    pub fn accept_transfer(server_id: &str, new_key: &UserIdentity) -> Vec<u8> {
-        new_key.sign(&chain::transfer_message(server_id, &new_key.public_key_hex()))
+    // ---------- Corrente de chaves (#99) ----------
+
+    /// Renova a validade da chave raiz em vigor (só quem a tem). O elo é publicado quando chegar o
+    /// carimbo de TSA.
+    pub fn renew_root(&mut self, server_id: &str, now: UtcSecs) -> Result<Submitted, CommunityError> {
+        let server = self.servers.get_mut(server_id).ok_or(CommunityError::UnknownServer)?;
+        if !server.has_chain() {
+            return Err(CommunityError::NoChainYet);
+        }
+        let key = server.owner_key.as_ref().ok_or(CommunityError::NotOwner)?;
+        let valid_until = now + server.chain.state().root_validity_secs;
+        let link = KeyLink::renew(key, server_id, &server.chain.ownership().head(), valid_until);
+        let submitted = Submitted { event_id: link.id(), imprint: link.imprint() };
+        server.key_outbox.insert(submitted.event_id.clone(), link);
+        self.persist(server_id)?;
+        Ok(submitted)
     }
 
-    /// Transfere a Chave do Servidor para `new_key` (que assinou a aceitação). Exige a chave atual.
-    /// O id do servidor não muda; passaportes da chave antiga valem até o prazo de carência.
-    pub fn transfer_server_key(
+    /// Passo 1 da transferência (quem tem a chave): proposta a `target` (identidade pessoal)
+    pub fn offer_transfer(&self, server_id: &str, personal: &UserIdentity, target: &str) -> Result<ServerMessage, CommunityError> {
+        let server = self.servers.get(server_id).ok_or(CommunityError::UnknownServer)?;
+        let key = server.owner_key.as_ref().ok_or(CommunityError::NotOwner)?;
+        if target == personal.public_key_hex() {
+            return Err(CommunityError::InvalidTransfer("não é possível transferir para si mesmo".into()));
+        }
+        Ok(ServerMessage::KeyTransferOffer {
+            server_id: server_id.to_string(),
+            target: target.to_string(),
+            previous_owner: personal.public_key_hex(),
+            key: key.public_key_hex(),
+            previous: server.chain.ownership().head(),
+        })
+    }
+
+    /// Passo 2 (quem recebe): gera a chave nova **nesta máquina**, guarda e assina a aceitação.
+    /// A chave vira a do dono quando a transferência entrar na corrente de chaves.
+    pub fn accept_transfer_offer(
+        &mut self,
+        server_id: &str,
+        me: &UserIdentity,
+        offer: &ServerMessage,
+        now: UtcSecs,
+    ) -> Result<ServerMessage, CommunityError> {
+        let ServerMessage::KeyTransferOffer { server_id: offer_server, target, previous_owner, key, previous } = offer else {
+            return Err(CommunityError::InvalidTransfer("não é uma proposta de transferência".into()));
+        };
+        if offer_server != server_id || *target != me.public_key_hex() {
+            return Err(CommunityError::InvalidTransfer("proposta para outro servidor ou pessoa".into()));
+        }
+        let server = self.servers.get(server_id).filter(|s| s.has_chain()).ok_or(CommunityError::NoChainYet)?;
+        let state = server.chain.state();
+        if state.current_root() != key || server.chain.ownership().head() != *previous {
+            return Err(CommunityError::InvalidTransfer("a proposta não parte da chave em vigor".into()));
+        }
+        let new_key = UserIdentity::generate_with_nick(&state.name);
+        let body = KeyLinkBody {
+            server_id: server_id.to_string(),
+            previous: previous.clone(),
+            key: key.clone(),
+            kind: KeyLinkKind::Transfer {
+                new_key: new_key.public_key_hex(),
+                valid_until: now + state.root_validity_secs,
+                previous_owner: Some(previous_owner.clone()),
+                new_owner: Some(me.public_key_hex()),
+            },
+        };
+        let new_key_signature = new_key.sign(&keychain::signing_bytes(&body));
+        self.store_server_key(server_id, new_key)?;
+        Ok(ServerMessage::KeyTransferAccept { server_id: server_id.to_string(), body, new_key_signature })
+    }
+
+    /// Passo 3 (quem tem a chave): confere a aceitação, assina o elo e o põe na fila do carimbo de TSA
+    pub fn complete_transfer(
         &mut self,
         server_id: &str,
         personal: &UserIdentity,
-        new_key: &str,
+        body: KeyLinkBody,
         new_key_signature: Vec<u8>,
-        now: UtcSecs,
     ) -> Result<Submitted, CommunityError> {
-        let server = self.servers.get(server_id).ok_or(CommunityError::UnknownServer)?;
-        let key = server.owner_key().ok_or(CommunityError::NotOwner)?;
-        let current_key_signature = key.sign(&chain::transfer_message(server_id, new_key));
-        let entry = Entry::TransferServerKey { new_key: new_key.to_string(), current_key_signature, new_key_signature };
-        self.submit(server_id, personal, entry, now)
+        let server = self.servers.get_mut(server_id).ok_or(CommunityError::UnknownServer)?;
+        let key = server.owner_key.as_ref().ok_or(CommunityError::NotOwner)?;
+        let KeyLinkKind::Transfer { previous_owner, .. } = &body.kind else {
+            return Err(CommunityError::InvalidTransfer("elo não é de transferência".into()));
+        };
+        if body.server_id != server_id
+            || body.key != key.public_key_hex()
+            || body.previous != server.chain.ownership().head()
+            || previous_owner.as_deref() != Some(personal.public_key_hex().as_str())
+        {
+            return Err(CommunityError::InvalidTransfer("a aceitação não corresponde à proposta".into()));
+        }
+        let link = KeyLink::transfer(key, body, new_key_signature);
+        if !link.verify_signatures(server_id) {
+            return Err(CommunityError::InvalidTransfer("assinatura de aceitação inválida".into()));
+        }
+        let submitted = Submitted { event_id: link.id(), imprint: link.imprint() };
+        server.key_outbox.insert(submitted.event_id.clone(), link);
+        self.persist(server_id)?;
+        Ok(submitted)
     }
 
     /// Guarda a chave recebida numa transferência; vira a chave do dono quando o registro confirmar
@@ -1371,6 +1536,8 @@ impl ServerRegistry {
             events: server.chain.events().map(|e| StoredEvent::store(e, &mut table)).collect(),
             outbox: server.outbox.values().map(|e| StoredEvent::store(e, &mut table)).collect(),
             event_passports: table,
+            keys: server.chain.key_links().cloned().collect(),
+            key_outbox: server.key_outbox.values().cloned().collect(),
         };
         std::fs::write(dir.join(format!("{}.server.json", server_id)), serde_json::to_vec_pretty(&stored)?)?;
         if let Some(passport) = &server.my_passport {
@@ -1396,7 +1563,7 @@ fn load_server_keys(dir: &Path, server_id: &str) -> Result<Vec<UserIdentity>, Co
 }
 
 fn events_message(server_id: &str, events: Vec<GovEvent>) -> ServerMessage {
-    ServerMessage::Events { server_id: server_id.to_string(), genesis: None, events }
+    ServerMessage::Events { server_id: server_id.to_string(), genesis: None, events, keys: Vec::new() }
 }
 
 /// Hash de carimbo em hex (64 caracteres) para bytes
@@ -1440,7 +1607,7 @@ pub fn describe_entry(entry: &Entry) -> String {
         Entry::Unban { target } => format!("desfez o ban de {}", short_id(target)),
         Entry::Revoke { target, serial } => format!("revogou o passaporte {} de {}", serial, short_id(target)),
         Entry::Renounce { .. } => "saiu do servidor (renunciou ao passaporte)".into(),
-        Entry::TransferServerKey { new_key, .. } => format!("transferiu a Chave do Servidor para {}", short_id(new_key)),
+        Entry::SetRootValidity { secs } => format!("definiu a validade da Chave do Servidor em {}", format_duration(Some(*secs))),
         Entry::Consolidate(c) => format!("consolidou o servidor (geração {})", c.generation),
     }
 }
@@ -2169,38 +2336,127 @@ mod tests {
         assert_eq!(member.get(&id).unwrap().chain().state().name, "Rust Guild");
     }
 
-    /// Transferência da Chave do Servidor: o id não muda; a chave nova emite; passaportes da
-    /// antiga valem no prazo de carência e depois só com carimbo anterior à transferência
+    /// Transferência da Chave do Servidor (#99) pelos três passos (proposta, aceitação na máquina de
+    /// quem recebe, elo assinado e carimbado pela TSA). O id não muda; a posse passa; quem entregou
+    /// sai da lista de protegidos e quem recebeu entra
+    fn transfer_to(f: &mut Fixture, to: &mut ServerRegistry, new_owner: &UserIdentity, at: u64) -> Vec<ServerMessage> {
+        let id = f.id.clone();
+        let offer = f.owner.offer_transfer(&id, &f.owner_id, &pk(new_owner)).unwrap();
+        let ServerMessage::KeyTransferAccept { body, new_key_signature, .. } = to.accept_transfer_offer(&id, new_owner, &offer, at).unwrap() else {
+            panic!("aceitação esperada")
+        };
+        let owner_id = f.owner_id.clone();
+        let s = f.owner.complete_transfer(&id, &owner_id, body, new_key_signature).unwrap();
+        let messages = f.stamp_owner(s, at);
+        deliver(to, messages.clone(), None, at);
+        messages
+    }
+
+    /// Passaporte emitido pela raiz atual do dono, com carimbo de TSA em `stamp_at` (se houver)
+    fn root_passport(f: &Fixture, holder: &UserIdentity, issued_at: u64, stamp_at: Option<u64>) -> ServerPassport {
+        let mut p = f.owner.issue_passport(&f.id, &f.owner_id, &pk(holder), PassportPermission::member(), None, issued_at).unwrap();
+        if let Some(at) = stamp_at {
+            let imprint = p.imprint();
+            p.add_stamp_to_link(&imprint, &f.tsa.stamp(&imprint, at));
+        }
+        p
+    }
+
     #[test]
     fn test_server_key_transfer() {
         let mut f = Fixture::new();
         let id = f.id.clone();
-        let owner = f.owner_id.clone();
-        let member_id = UserIdentity::generate();
-        let old_passport = f.owner.issue_passport(&id, &owner, &pk(&member_id), PassportPermission::member(), Some(30 * 86_400), T0 + 1).unwrap();
+        let b = UserIdentity::generate();
+        let mut b_reg = f.member(T0);
+        let m = UserIdentity::generate();
+        // Emitidos pela chave antiga antes da transferência: um carimbado pela TSA, outro não
+        let stamped = root_passport(&f, &m, T0 + 1, Some(T0 + 1));
+        let unstamped = root_passport(&f, &m, T0 + 1, None);
 
-        let new_key = UserIdentity::generate();
-        let acceptance = ServerRegistry::accept_transfer(&id, &new_key);
-        // Assinatura de aceitação de outra chave não serve
-        let wrong = ServerRegistry::accept_transfer(&id, &UserIdentity::generate());
-        assert!(f.owner.transfer_server_key(&id, &owner, &pk(&new_key), wrong, T0 + 2).is_err());
-        let s = f.owner.transfer_server_key(&id, &owner, &pk(&new_key), acceptance, T0 + 2).unwrap();
-        let messages = f.stamp_owner(s, T0 + 2);
+        // Aceitação não pode ser forjada nem vir de outra pessoa
+        let offer = f.owner.offer_transfer(&id, &f.owner_id, &pk(&b)).unwrap();
+        assert!(b_reg.accept_transfer_offer(&id, &UserIdentity::generate(), &offer, T0 + 2).is_err(), "proposta é para B");
+        assert!(f.owner.offer_transfer(&id, &UserIdentity::generate(), &pk(&b)).is_ok(), "quem tem a chave propõe");
+        assert!(b_reg.offer_transfer(&id, &b, &pk(&f.owner_id)).is_err(), "sem a chave não propõe");
+
+        transfer_to(&mut f, &mut b_reg, &b, T0 + 10);
+        let t = T0 + 10;
         assert!(!f.owner.get(&id).unwrap().is_owner(), "a chave antiga deixou de ser a raiz");
-
-        let mut b = f.member(T0);
-        deliver(&mut b, messages, None, T0 + 3);
-        b.store_server_key(&id, new_key).unwrap();
-        let server = b.get(&id).unwrap();
-        assert!(server.is_owner(), "quem recebeu a chave passa a emitir");
-        assert_eq!(server.chain().state().current_root(), pk(&server.owner_key().unwrap().clone()));
+        let server = b_reg.get(&id).unwrap();
+        assert!(server.is_owner(), "quem recebeu passa a emitir");
         let state = server.chain().state();
-        assert!(state.verify_passport(&old_passport, T0 + 10).is_ok(), "no prazo de carência");
-        assert!(state.verify_passport(&old_passport, T0 + 2 + chain::TRANSFER_GRACE_SECS + 1).is_err(), "depois, sem carimbo anterior, não vale");
-        let new_passport = b.issue_passport(&id, &UserIdentity::generate(), &pk(&member_id), PassportPermission::member(), None, T0 + 20).unwrap();
-        assert!(state.verify_passport(&new_passport, T0 + 2 + chain::TRANSFER_GRACE_SECS + 1).is_ok());
-        // Passaporte novo emitido pela chave antiga não vale mais
-        let forged = ServerPassport::issue_root_for(&id, f.owner.get(&id).unwrap().stored_keys.first().unwrap(), &pk(&member_id), PassportPermission::all(), T0 + 30, None);
-        assert!(state.verify_passport(&forged, T0 + 2 + chain::TRANSFER_GRACE_SECS + 1).is_err());
+        assert_eq!(state.roots.len(), 2);
+        assert_eq!(state.roots[0].until, Some(t), "marco T");
+        assert!(state.protected.contains(&pk(&b)) && !state.protected.contains(&pk(&f.owner_id)), "proteção passa ao novo dono");
+        assert_eq!(server.server_id, id, "o id não muda");
+
+        // Marco: elo da chave antiga só vale com carimbo de TSA anterior a T
+        assert!(state.verify_passport(&stamped, t + 5).is_ok(), "comprovado antes de T");
+        assert!(state.verify_passport(&unstamped, t + 5).is_err(), "sem prova: sem carência");
+        // O antigo dono ainda tem a chave antiga e assina com data retroativa
+        let old_key = f.owner.get(&id).unwrap().stored_keys.first().unwrap().clone();
+        let mut backdated = ServerPassport::issue_root_for(&id, &old_key, &pk(&m), PassportPermission::all(), T0 + 1, None);
+        let imprint = backdated.imprint();
+        backdated.add_stamp_to_link(&imprint, &f.tsa.stamp(&imprint, t + 20));
+        assert!(f.owner.issue_passport(&id, &f.owner_id, &pk(&m), PassportPermission::member(), None, t + 20).is_err(), "o antigo dono não emite mais");
+        assert!(state.verify_passport(&backdated, t + 30).is_err(), "data retroativa carimbada depois de T não vale");
+        // ... e nada da chave antiga vale depois do vencimento dela
+        let old_expiry = state.roots[0].expires_at;
+        assert!(state.verify_passport(&stamped, old_expiry).is_err(), "morre no vencimento da chave antiga");
+        let new_passport = b_reg.issue_passport(&id, &b, &pk(&m), PassportPermission::member(), None, t + 40).unwrap();
+        assert!(state.verify_passport(&new_passport, t + 50).is_ok());
+    }
+
+    /// Nada é vitalício: o passaporte do dono vence com a raiz; a renovação estende
+    #[test]
+    fn test_root_expiry_and_renewal() {
+        let mut f = Fixture::new();
+        let id = f.id.clone();
+        let m = UserIdentity::generate();
+        let p = root_passport(&f, &m, T0 + 1, None);
+        let expires = f.owner.get(&id).unwrap().chain().state().root_expires_at();
+        assert_eq!(expires, T0 + keychain::DEFAULT_ROOT_VALIDITY_SECS, "90 dias por padrão");
+        let state = f.owner.get(&id).unwrap().chain().state();
+        assert!(state.verify_passport(&p, expires - 1).is_ok());
+        assert!(state.verify_passport(&p, expires).is_err(), "venceu com a raiz");
+
+        let mut member = f.member(T0);
+        let s = f.owner.renew_root(&id, T0 + 60 * 86_400).unwrap();
+        let messages = f.stamp_owner(s, T0 + 60 * 86_400);
+        assert!(!messages.is_empty(), "renovação publicada");
+        deliver(&mut member, messages, None, T0 + 60 * 86_400);
+        for reg in [&f.owner, &member] {
+            let state = reg.get(&id).unwrap().chain().state();
+            assert_eq!(state.root_expires_at(), T0 + 150 * 86_400);
+            assert!(state.verify_passport(&p, expires + 1).is_ok(), "renovada: volta a valer");
+        }
+        assert!(f.owner.get(&id).unwrap().outbox().count() == 0);
+        assert!(member.renew_root(&id, T0).is_err(), "só quem tem a chave renova");
+    }
+
+    /// A consolidação não carrega a posse: quem entra depois resolve as raízes pela corrente de chaves
+    #[test]
+    fn test_newcomer_after_consolidation_gets_ownership_from_key_chain() {
+        let mut f = Fixture::new();
+        let id = f.id.clone();
+        let b = UserIdentity::generate();
+        let mut b_reg = f.member(T0);
+        transfer_to(&mut f, &mut b_reg, &b, T0 + 10);
+        let s = b_reg.add_channel(&id, &b, "novo", ChannelType::Text, T0 + 20).unwrap();
+        let stamp = f.tsa.stamp(&s.imprint, T0 + 20);
+        b_reg.attach_stamp(&id, &s.imprint, &stamp, T0 + 20);
+        let s = b_reg.consolidate(&id, &b, T0 + 30).unwrap();
+        let stamp = f.tsa.stamp(&s.imprint, T0 + 30);
+        b_reg.attach_stamp(&id, &s.imprint, &stamp, T0 + 30);
+        assert_eq!(b_reg.get(&id).unwrap().chain().state().generation, 1);
+
+        let mut late = ServerRegistry::in_memory();
+        late.join(&id).unwrap();
+        sync(&b_reg, &mut late, &id, T0 + 40);
+        let state = late.get(&id).unwrap().chain().state();
+        assert_eq!(state.generation, 1);
+        assert_eq!(state.current_root(), b_reg.get(&id).unwrap().owner_key().unwrap().public_key_hex(), "posse pela corrente de chaves");
+        assert!(state.channels.iter().any(|c| c.name == "novo"));
+        assert!(state.protected.contains(&pk(&b)));
     }
 }

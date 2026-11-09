@@ -25,11 +25,12 @@
 //! - **Consolidação** (#52): nova Genesis dentro do registro. Vira o ponto de partida; evento com
 //!   carimbo anterior a ela é recusado. Consolidações concorrentes da mesma geração se resolvem pela
 //!   mais antiga (tempo, id) dentro de uma janela de acomodação.
-//! - **Transferência da Chave do Servidor**: evento com a assinatura da chave atual e da nova; o id
-//!   do servidor não muda, só a raiz que emite passaportes.
+//! - **Posse da Chave do Servidor**: fica numa corrente própria, nunca consolidada
+//!   ([`super::keychain`]); o id do servidor não muda, só a raiz que emite passaportes.
 
+use super::keychain::{AppliedTransfer, KeyChain, KeyLink, Ownership, RootKey, DEFAULT_ROOT_VALIDITY_SECS};
 use super::passport::{PassportError, PassportPermission, ServerPassport, UtcSecs};
-use super::timestamp::{verify_rfc3161, TimestampAttestation, TimestampPolicy};
+use super::timestamp::{verify_rfc3161, TimestampAttestation, TimestampPolicy, TrustedTsa};
 use crate::identity::{verify_signature_hex, UserIdentity};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -42,9 +43,6 @@ pub const CLOCK_SKEW_SECS: u64 = super::passport::CLOCK_SKEW_SECS;
 pub const DEFAULT_PASSPORT_VALIDITY_SECS: u64 = 7 * 86_400;
 /// Janela de renovação padrão (antes de expirar)
 pub const DEFAULT_RENEWAL_WINDOW_SECS: u64 = 2 * 86_400;
-/// Depois de transferir a Chave do Servidor, passaportes da raiz antiga sem carimbo anterior à
-/// transferência ainda valem por esse prazo (para serem reemitidos pela raiz nova)
-pub const TRANSFER_GRACE_SECS: u64 = 7 * 86_400;
 /// Janela em que uma consolidação concorrente da mesma geração ainda pode substituir a aceita
 pub const CONSOLIDATION_SETTLE_SECS: u64 = 10 * 60;
 /// Até quantos níveis de carimbo-de-testemunha-de-testemunha a verificação desce
@@ -79,6 +77,8 @@ pub struct ServerConfig {
     pub protected: BTreeSet<String>,
     /// Intervalo da consolidação automática (0 = desligada)
     pub consolidation_interval_secs: u64,
+    /// Validade da chave raiz a cada renovação ou transferência (#99)
+    pub root_validity_secs: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -87,6 +87,8 @@ pub struct GenesisBody {
     pub config: ServerConfig,
     /// Informativo (relógio de quem criou); o tempo que vale nos eventos é o dos carimbos
     pub created_at: UtcSecs,
+    /// Vencimento da primeira chave raiz (o id do servidor); renovável pela corrente de chaves
+    pub root_valid_until: UtcSecs,
 }
 
 /// Configuração inicial do servidor, assinada pela Chave do Servidor
@@ -99,7 +101,8 @@ pub struct Genesis {
 
 impl Genesis {
     pub fn create(server_key: &UserIdentity, config: ServerConfig, created_at: UtcSecs) -> Self {
-        let body = GenesisBody { server_id: server_key.public_key_hex(), config, created_at };
+        let root_valid_until = created_at + config.root_validity_secs;
+        let body = GenesisBody { server_id: server_key.public_key_hex(), config, created_at, root_valid_until };
         let signature = server_key.sign(&crate::wire::signing_bytes("genesis", &body));
         Self { body, signature }
     }
@@ -107,15 +110,6 @@ impl Genesis {
     pub fn verify(&self, server_id: &str) -> bool {
         self.body.server_id == server_id && verify_signature_hex(server_id, &crate::wire::signing_bytes("genesis", &self.body), &self.signature)
     }
-}
-
-/// Chave raiz que emite passaportes (a do servidor e as que a receberam por transferência)
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct RootKey {
-    pub pubkey: String,
-    pub since: UtcSecs,
-    /// Fim da validade (transferida para outra chave)
-    pub until: Option<UtcSecs>,
 }
 
 /// Um ban registrado sobre uma pubkey
@@ -134,9 +128,8 @@ pub struct BanState {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct StateSnapshot {
     pub config: ServerConfig,
-    pub roots: Vec<RootKey>,
     pub revoked: BTreeSet<String>,
-        pub bans: BTreeMap<String, Vec<BanState>>,
+    pub bans: BTreeMap<String, Vec<BanState>>,
 }
 
 /// Consolidação: nova Genesis dentro do registro
@@ -172,14 +165,8 @@ pub enum Entry {
     Revoke { target: String, serial: String },
     /// O próprio titular abre mão do passaporte (saiu do servidor)
     Renounce { serial: String },
-    /// Transfere a Chave do Servidor: assinaturas da chave atual (autoriza) e da nova (aceita)
-    TransferServerKey {
-        new_key: String,
-        #[serde(with = "crate::b64")]
-        current_key_signature: Vec<u8>,
-        #[serde(with = "crate::b64")]
-        new_key_signature: Vec<u8>,
-    },
+    /// Validade da chave raiz a cada renovação ou transferência
+    SetRootValidity { secs: u64 },
     /// Consolidação (nova Genesis)
     Consolidate(Box<Consolidation>),
 }
@@ -194,7 +181,7 @@ impl Entry {
             | Entry::SetPassportPolicy { .. }
             | Entry::SetAccessPow { .. }
             | Entry::SetConsolidationInterval { .. }
-            | Entry::TransferServerKey { .. } => PassportPermission::ManageConfig,
+            | Entry::SetRootValidity { .. } => PassportPermission::ManageConfig,
             Entry::SetTimestampPolicy(_) => PassportPermission::ManageTimestampPolicy,
             Entry::SetProtected { .. } => PassportPermission::ManageProtected,
             Entry::Ban { .. } | Entry::Unban { .. } | Entry::Revoke { .. } => PassportPermission::Ban,
@@ -210,11 +197,6 @@ impl Entry {
             _ => None,
         }
     }
-}
-
-/// O que a chave atual e a nova assinam numa transferência
-pub fn transfer_message(server_id: &str, new_key: &str) -> Vec<u8> {
-    crate::wire::signing_bytes("server-key-transfer", &(server_id, new_key))
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -311,7 +293,6 @@ pub enum Rejection {
     AlreadyApplied,
     /// Carimbo anterior à última consolidação
     BeforeConsolidation,
-    BadTransfer,
     BadConsolidation(String),
 }
 
@@ -337,7 +318,6 @@ impl std::fmt::Display for Rejection {
             Rejection::NotOwnPassport => f.write_str("só o titular renuncia, e só ao passaporte que apresenta"),
             Rejection::AlreadyApplied => f.write_str("evento já aplicado"),
             Rejection::BeforeConsolidation => f.write_str("evento anterior à última consolidação"),
-            Rejection::BadTransfer => f.write_str("transferência sem as assinaturas da chave atual e da nova"),
             Rejection::BadConsolidation(why) => write!(f, "consolidação inválida: {}", why),
         }
     }
@@ -357,7 +337,11 @@ pub struct ServerState {
     pub access_pow_bits: u8,
     pub protected: BTreeSet<String>,
     pub consolidation_interval_secs: u64,
+    /// Chaves raiz, resolvidas pela corrente de chaves (nunca pela consolidação)
     pub roots: Vec<RootKey>,
+    /// Transferências ainda a aplicar na lista de protegidos (posteriores ao ponto de partida)
+    pending_transfers: Vec<AppliedTransfer>,
+    pub root_validity_secs: u64,
     /// Seriais de passaporte revogados
     pub revoked: BTreeSet<String>,
     pub bans: BTreeMap<String, Vec<BanState>>,
@@ -375,20 +359,39 @@ pub struct ServerState {
 }
 
 impl ServerState {
-    fn from_genesis(genesis: &Genesis) -> Self {
+    fn from_genesis(genesis: &Genesis, ownership: &Ownership) -> Self {
         let mut state = Self { server_id: genesis.body.server_id.clone(), ..Self::default() };
         state.set_config(&genesis.body.config);
-        state.roots = vec![RootKey { pubkey: genesis.body.server_id.clone(), since: 0, until: None }];
+        state.set_ownership(ownership);
         state
     }
 
-    fn from_snapshot(server_id: &str, snapshot: &StateSnapshot, generation: u64, base_time: UtcSecs) -> Self {
+    fn from_snapshot(server_id: &str, snapshot: &StateSnapshot, generation: u64, base_time: UtcSecs, ownership: &Ownership) -> Self {
         let mut state = Self { server_id: server_id.to_string(), generation, base_time, ..Self::default() };
         state.set_config(&snapshot.config);
-        state.roots = snapshot.roots.clone();
+        state.set_ownership(ownership);
         state.revoked = snapshot.revoked.clone();
         state.bans = snapshot.bans.clone();
         state
+    }
+
+    /// Raízes da corrente de chaves; as transferências anteriores ao ponto de partida já estão na lista de protegidos
+    fn set_ownership(&mut self, ownership: &Ownership) {
+        self.roots = ownership.roots.clone();
+        self.pending_transfers = ownership.transfers.iter().filter(|t| t.at > self.base_time).cloned().collect();
+    }
+
+    /// Transferência: quem entregou a chave sai da lista de protegidos, quem recebeu entra
+    fn apply_transfers_until(&mut self, at: UtcSecs) {
+        while self.pending_transfers.first().is_some_and(|t| t.at <= at) {
+            let transfer = self.pending_transfers.remove(0);
+            if let Some(previous) = &transfer.previous_owner {
+                self.protected.remove(previous);
+            }
+            if let Some(new) = &transfer.new_owner {
+                self.protected.insert(new.clone());
+            }
+        }
     }
 
     fn set_config(&mut self, config: &ServerConfig) {
@@ -401,6 +404,7 @@ impl ServerState {
         self.access_pow_bits = config.access_pow_bits;
         self.protected = config.protected.clone();
         self.consolidation_interval_secs = config.consolidation_interval_secs;
+        self.root_validity_secs = config.root_validity_secs;
     }
 
     pub fn config(&self) -> ServerConfig {
@@ -414,12 +418,18 @@ impl ServerState {
             access_pow_bits: self.access_pow_bits,
             protected: self.protected.clone(),
             consolidation_interval_secs: self.consolidation_interval_secs,
+            root_validity_secs: self.root_validity_secs,
         }
     }
 
     /// Estado consolidado (determinístico: quem confere chega ao mesmo resultado)
     pub fn snapshot(&self) -> StateSnapshot {
-        StateSnapshot { config: self.config(), roots: self.roots.clone(), revoked: self.revoked.clone(), bans: self.bans.clone() }
+        StateSnapshot { config: self.config(), revoked: self.revoked.clone(), bans: self.bans.clone() }
+    }
+
+    /// Vencimento da chave raiz em vigor
+    pub fn root_expires_at(&self) -> UtcSecs {
+        self.roots.last().map_or(0, |r| r.expires_at)
     }
 
     /// Chave raiz em vigor (a que emite passaportes agora)
@@ -457,7 +467,10 @@ impl ServerState {
                     self.rejected_actions.insert(id, Rejection::NoTimestamp);
                 }
                 Some(verified) if verified > t && requeued.insert(id.clone()) => queue.push(Reverse((verified, id))),
-                Some(verified) => match self.check_event(event, verified) {
+                Some(verified) => match {
+                    self.apply_transfers_until(verified.saturating_sub(1));
+                    self.check_event(event, verified)
+                } {
                     Ok(()) => self.apply_entry(event, verified),
                     Err(rejection) => {
                         self.rejected_actions.insert(id, rejection);
@@ -465,6 +478,7 @@ impl ServerState {
                 },
             }
         }
+        self.apply_transfers_until(UtcSecs::MAX);
     }
 
     /// Tempo atestado do evento: o carimbo aceito mais antigo pela política vigente
@@ -537,14 +551,6 @@ impl ServerState {
             Entry::Unban { target } if !self.bans.get(target).is_some_and(|bans| bans.iter().any(|b| b.by == actor && b.starts_at <= at)) => {
                 return Err(Rejection::NotBanAuthor);
             }
-            Entry::TransferServerKey { new_key, current_key_signature, new_key_signature } => {
-                let message = transfer_message(&self.server_id, new_key);
-                if !verify_signature_hex(self.current_root(), &message, current_key_signature)
-                    || !verify_signature_hex(new_key, &message, new_key_signature)
-                {
-                    return Err(Rejection::BadTransfer);
-                }
-            }
             Entry::Consolidate(consolidation) if consolidation.generation != self.generation + 1 => {
                 return Err(Rejection::BadConsolidation(format!("geração {} (esperada {})", consolidation.generation, self.generation + 1)));
             }
@@ -605,12 +611,7 @@ impl ServerState {
             Entry::Revoke { serial, .. } | Entry::Renounce { serial } => {
                 self.revoked.insert(serial.clone());
             }
-            Entry::TransferServerKey { new_key, .. } => {
-                for root in self.roots.iter_mut().filter(|r| r.until.is_none()) {
-                    root.until = Some(at);
-                }
-                self.roots.push(RootKey { pubkey: new_key.clone(), since: at, until: None });
-            }
+            Entry::SetRootValidity { secs } => self.root_validity_secs = *secs,
             // Consolidações são aplicadas pela `ServerChain` (trocam o ponto de partida)
             Entry::Consolidate(_) => {}
         }
@@ -649,12 +650,17 @@ impl ServerState {
             return Err(PassportError::RevokedOrBanned(holder.clone()));
         }
         let links = passport.links();
-        // Raiz transferida: o elo dela só vale com carimbo anterior à transferência (ou no prazo de carência)
+        // Raiz do passaporte (#99): nada vale depois do vencimento dela; transferida em T, o elo emitido
+        // por ela só vale com carimbo de TSA anterior a T (a data de emissão é declarada pelo emissor)
         if let Some(root_link) = links.last() {
-            if let Some(until) = self.roots.iter().find(|r| r.pubkey == root_link.body.issuer).and_then(|r| r.until) {
-                let in_grace = at < until + TRANSFER_GRACE_SECS;
-                if !in_grace && !(depth > 0 && self.proven_before(root_link, until, &root_link.body.issuer, depth - 1)) {
-                    return Err(PassportError::RevokedOrBanned(root_link.body.issuer.clone()));
+            let issuer = &root_link.body.issuer;
+            let root = self.roots.iter().find(|r| &r.pubkey == issuer).ok_or_else(|| PassportError::RevokedOrBanned(issuer.clone()))?;
+            if at >= root.expires_at {
+                return Err(PassportError::Expired { expires_at: root.expires_at, at });
+            }
+            if let Some(transferred_at) = root.until {
+                if !self.proven_by_tsa_before(root_link, transferred_at) {
+                    return Err(PassportError::RevokedOrBanned(issuer.clone()));
                 }
             }
         }
@@ -673,6 +679,17 @@ impl ServerState {
             }
         }
         Ok(())
+    }
+
+    /// Algum carimbo de TSA da política prova que o elo existia antes de `t`
+    fn proven_by_tsa_before(&self, link: &ServerPassport, t: UtcSecs) -> bool {
+        let imprint = link.imprint();
+        link.stamps.iter().any(|s| match s {
+            TimestampAttestation::Rfc3161 { token_der, .. } => {
+                verify_rfc3161(token_der, &imprint, &self.timestamp_policy.tsas).is_ok_and(|(at, _)| at < t)
+            }
+            TimestampAttestation::Peer(_) => false,
+        })
     }
 
     /// Algum carimbo aceito prova que o elo existia antes de `t`
@@ -738,6 +755,9 @@ pub struct ServerChain {
     /// Ponto de partida e eventos anteriores à última consolidação, guardados durante a janela de
     /// acomodação (uma consolidação concorrente mais antiga ainda pode substituí-la)
     previous: Option<(Base, BTreeMap<String, GovEvent>)>,
+    /// Corrente de chaves (nunca consolidada) e a posse resolvida a partir dela
+    keys: KeyChain,
+    ownership: Ownership,
     state: ServerState,
 }
 
@@ -749,6 +769,8 @@ impl ServerChain {
             base: Base::Genesis,
             events: BTreeMap::new(),
             previous: None,
+            keys: KeyChain::default(),
+            ownership: Ownership::default(),
             state: ServerState { server_id: server_id.to_string(), ..ServerState::default() },
         }
     }
@@ -793,6 +815,7 @@ impl ServerChain {
     /// Ids que este nó conhece (para a sincronização por inventário)
     pub fn inventory(&self) -> BTreeSet<String> {
         let mut ids: BTreeSet<String> = self.events.keys().cloned().collect();
+        ids.extend(self.keys.links().map(KeyLink::id));
         if let Some(base) = self.base_consolidation() {
             ids.insert(base.id());
         }
@@ -956,16 +979,57 @@ impl ServerChain {
     }
 
     fn rebuild(&mut self) {
-        let Some(genesis) = &self.genesis else { return };
-        let mut state = match &self.base {
-            Base::Genesis => ServerState::from_genesis(genesis),
-            Base::Consolidation(event, at) => match &event.body.entry {
-                Entry::Consolidate(c) => ServerState::from_snapshot(&self.server_id, &c.snapshot, c.generation, *at),
-                _ => ServerState::from_genesis(genesis),
-            },
-        };
-        state.apply_all(&self.events);
-        self.state = state;
+        let Some(genesis) = self.genesis.clone() else { return };
+        // A posse vem da corrente de chaves. Os carimbos dela valem pelas TSAs da Genesis e pelas da
+        // política atual (que pode ter mudado): resolve, calcula o estado e, se a política trouxer
+        // TSAs novas, resolve de novo.
+        let mut tsas: Vec<TrustedTsa> = genesis.body.config.timestamp_policy.tsas.clone();
+        for _ in 0..2 {
+            self.ownership = self.keys.resolve(&genesis, &tsas);
+            let mut state = match &self.base {
+                Base::Genesis => ServerState::from_genesis(&genesis, &self.ownership),
+                Base::Consolidation(event, at) => match &event.body.entry {
+                    Entry::Consolidate(c) => ServerState::from_snapshot(&self.server_id, &c.snapshot, c.generation, *at, &self.ownership),
+                    _ => ServerState::from_genesis(&genesis, &self.ownership),
+                },
+            };
+            state.apply_all(&self.events);
+            self.state = state;
+            let extra: Vec<TrustedTsa> = self.state.timestamp_policy.tsas.iter().filter(|t| !tsas.contains(t)).cloned().collect();
+            if extra.is_empty() {
+                break;
+            }
+            tsas.extend(extra);
+        }
+    }
+
+    /// Elos conhecidos da corrente de chaves
+    pub fn key_links(&self) -> impl Iterator<Item = &KeyLink> {
+        self.keys.links()
+    }
+
+    /// Posse resolvida (raízes, transferências e o último elo aceito)
+    pub fn ownership(&self) -> &Ownership {
+        &self.ownership
+    }
+
+    /// Acrescenta elos da corrente de chaves (assinaturas conferidas). Devolve `true` se a posse mudou.
+    pub fn add_key_links(&mut self, links: Vec<KeyLink>) -> bool {
+        let mut changed = false;
+        for link in links {
+            changed |= self.keys.insert(link, &self.server_id);
+        }
+        if !changed || self.genesis.is_none() {
+            return false;
+        }
+        let before = self.ownership.clone();
+        self.rebuild();
+        self.ownership != before
+    }
+
+    /// O elo está no caminho aceito da corrente de chaves
+    pub fn key_link_accepted(&self, id: &str) -> bool {
+        self.ownership.path.iter().any(|(link, _)| link == id)
     }
 
     /// Consolidação do estado atual (para quem tem `Consolidate` publicar)
@@ -998,5 +1062,6 @@ pub fn default_config(name: &str, owner: &str, channels: Vec<Channel>, policy: T
         access_pow_bits: 0,
         protected: [owner.to_string()].into_iter().collect(),
         consolidation_interval_secs: 0,
+        root_validity_secs: DEFAULT_ROOT_VALIDITY_SECS,
     }
 }

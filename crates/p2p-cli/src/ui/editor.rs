@@ -51,6 +51,10 @@ pub const COMMANDS: &[&str] = &[
     "/server ban ",
     "/server unban ",
     "/server leave",
+    "/server key",
+    "/server key renew",
+    "/server key transfer ",
+    "/server key accept",
 ];
 
 #[derive(Default)]

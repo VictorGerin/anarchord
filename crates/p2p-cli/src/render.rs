@@ -429,6 +429,43 @@ fn server(notice: &ServerNotice) -> Vec<String> {
             (Some(leader), false) => format!("👑 [{}] Novo líder do grupo cifrado: {}.", server, leader),
             (None, _) => format!("👑 [{}] Grupo cifrado sem líder no momento (aguardando membros).", server),
         }),
+        ServerNotice::KeyChain { server, roots, mine } => {
+            let mut lines = vec![format!("🔑 Corrente de chaves de '{}'{}:", server, if *mine { " (a chave em vigor está com você)" } else { "" })];
+            for (pubkey, since, until, expires_at) in roots {
+                let since = if *since == 0 { "desde a criação".to_string() } else { format!("desde {}", fmt_utc(*since)) };
+                let state = match until {
+                    Some(t) => format!("transferida em {}", fmt_utc(*t)),
+                    None => format!("em vigor, vence em {}", fmt_utc(*expires_at)),
+                };
+                lines.push(format!("   {}… {} — {}", short_id(pubkey), since, state));
+            }
+            lines
+        }
+        ServerNotice::KeyLinkRequested { server, transfer } => one(format!(
+            "⏳ [{}] {} pedida: vale quando chegar o carimbo da autoridade de tempo (TSA).",
+            server,
+            if *transfer { "Transferência da Chave do Servidor" } else { "Renovação da Chave do Servidor" }
+        )),
+        ServerNotice::TransferOffered { server, target } => {
+            one(format!("🔑 [{}] Proposta de transferência da Chave do Servidor enviada a {}. Ele precisa aceitar (/server key accept).", server, target))
+        }
+        ServerNotice::TransferOfferReceived { server, from } => one(format!(
+            "🔑 [{}] {} quer transferir a Chave do Servidor para você. Para aceitar: /server key accept (a chave nova é gerada nesta máquina).",
+            server, from
+        )),
+        ServerNotice::TransferAccepted { server } => {
+            one(format!("🔑 [{}] Transferência aceita: a chave nova foi gerada e guardada aqui. Vale quando o carimbo da TSA chegar.", server))
+        }
+        ServerNotice::OwnershipChanged { server, owner, expires_at } => one(if *owner {
+            format!("👑 [{}] A Chave do Servidor em vigor está com você (vence em {}).", server, fmt_utc(*expires_at))
+        } else {
+            format!("🔑 [{}] Corrente de chaves atualizada (a chave em vigor vence em {}).", server, fmt_utc(*expires_at))
+        }),
+        ServerNotice::RootExpiring { server, expires_at } => one(format!(
+            "⚠️ [{}] A Chave do Servidor vence em {}. Renove com /server key renew: depois do vencimento, todos os passaportes do servidor deixam de valer.",
+            server,
+            fmt_utc(*expires_at)
+        )),
         ServerNotice::KeyRotated { server, epoch } => {
             one(format!("🔄 Chave do grupo MLS de '{}' rotacionada (época {}).", server, epoch))
         }

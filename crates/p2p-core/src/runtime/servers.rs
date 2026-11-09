@@ -272,6 +272,8 @@ impl Runtime {
     /// Ciclo periódico: pede cadeias que faltam, pede acesso, cuida do grupo
     /// cifrado e da manutenção do dono
     pub(super) fn server_sync_tick(&mut self) {
+        /// Antecedência do aviso de vencimento da Chave do Servidor
+        const ROOT_EXPIRY_WARNING_SECS: u64 = 7 * 86_400;
         // Quem ainda não tem a cadeia pede com espera crescente (não a cada ciclo)
         for id in self.servers.list().filter(|s| !s.has_chain()).map(|s| s.server_id.clone()).collect::<Vec<_>>() {
             if self.chain_request_due(&id) {
@@ -319,6 +321,18 @@ impl Runtime {
         // garantir a revogação é papel do servidor)
         for (server_id, message) in self.servers.pending_renounces(now) {
             self.publish_server_message(&server_id, &message);
+        }
+        // Chave do Servidor deste nó perto de vencer: avisa uma vez por execução (renovar com /server key renew)
+        let expiring: Vec<(String, u64)> = self
+            .servers
+            .list()
+            .filter(|s| s.is_owner() && s.has_chain())
+            .map(|s| (s.server_id.clone(), s.chain().state().root_expires_at()))
+            .filter(|(id, expires_at)| *expires_at <= now + ROOT_EXPIRY_WARNING_SECS && !self.root_expiry_warned.contains(id))
+            .collect();
+        for (id, expires_at) in expiring {
+            self.root_expiry_warned.insert(id.clone());
+            self.notice(ServerNotice::RootExpiring { server: self.server_name(&id), expires_at });
         }
         // Consolidação periódica (quem tem a permissão) e eventos da fila ainda sem carimbo: pede de novo
         for id in self.servers.list().map(|s| s.server_id.clone()).collect::<Vec<_>>() {
@@ -745,6 +759,52 @@ impl Runtime {
                     self.error(CoreError::Server("Você ainda não possui um passaporte registrado neste servidor".into()));
                 }
             }
+            ServerCommand::KeyShow => {
+                let id = need_server!();
+                let Some(server) = self.servers.get(&id).filter(|s| s.has_chain()) else { return };
+                let roots = server
+                    .chain()
+                    .state()
+                    .roots
+                    .iter()
+                    .map(|r| (r.pubkey.clone(), r.since, r.until, r.expires_at))
+                    .collect();
+                let mine = server.is_owner();
+                self.notice(ServerNotice::KeyChain { server: self.server_name(&id), roots, mine });
+            }
+            ServerCommand::KeyRenew => {
+                let id = need_server!();
+                match self.servers.renew_root(&id, now) {
+                    Ok(submitted) => {
+                        self.request_stamps(&id, submitted.imprint);
+                        self.notice(ServerNotice::KeyLinkRequested { server: self.server_name(&id), transfer: false });
+                    }
+                    Err(e) => self.error(CoreError::Server(e.to_string())),
+                }
+            }
+            ServerCommand::KeyTransfer(target) => {
+                let id = need_server!();
+                let pubkey = need_peer!(target);
+                match self.servers.offer_transfer(&id, &self.identity, &pubkey) {
+                    Ok(offer) => {
+                        self.publish_server_message(&id, &offer);
+                        self.notice(ServerNotice::TransferOffered { server: self.server_name(&id), target: self.nick_for(&pubkey) });
+                    }
+                    Err(e) => self.error(CoreError::Server(e.to_string())),
+                }
+            }
+            ServerCommand::KeyAccept => {
+                let Some((id, offer)) = self.pending_transfer_offer.take() else {
+                    return self.error(CoreError::Server("Nenhuma proposta de transferência pendente".into()));
+                };
+                match self.servers.accept_transfer_offer(&id, &self.identity, &offer, now) {
+                    Ok(accept) => {
+                        self.publish_server_message(&id, &accept);
+                        self.notice(ServerNotice::TransferAccepted { server: self.server_name(&id) });
+                    }
+                    Err(e) => self.error(CoreError::Server(e.to_string())),
+                }
+            }
             ServerCommand::FlattenPassport => {
                 let id = need_server!();
                 let Some(server) = self.servers.get(&id) else { return };
@@ -934,6 +994,27 @@ impl Runtime {
                 }
                 return;
             }
+            ServerMessage::KeyTransferOffer { server_id, target, .. } => {
+                if *target == me {
+                    if let Some(from) = from_pubkey {
+                        self.pending_transfer_offer = Some((server_id.clone(), message.clone()));
+                        self.notice(ServerNotice::TransferOfferReceived { server: self.server_name(server_id), from: self.nick_for(from) });
+                    }
+                }
+                return;
+            }
+            ServerMessage::KeyTransferAccept { server_id, body, new_key_signature } => {
+                if self.servers.get(server_id).is_some_and(|s| s.is_owner()) {
+                    match self.servers.complete_transfer(server_id, &self.identity, body.clone(), new_key_signature.clone()) {
+                        Ok(submitted) => {
+                            self.request_stamps(server_id, submitted.imprint);
+                            self.notice(ServerNotice::KeyLinkRequested { server: self.server_name(server_id), transfer: true });
+                        }
+                        Err(e) => self.error(CoreError::Server(e.to_string())),
+                    }
+                }
+                return;
+            }
             ServerMessage::FlattenRequest { server_id, passport } => {
                 if let Some(server) = self.servers.get(server_id) {
                     let flattened = if let Some(owner_key) = server.owner_key() {
@@ -1062,6 +1143,13 @@ impl Runtime {
                 ServerEvent::Reply { server_id, messages } => {
                     for m in &messages {
                         self.publish_server_message(&server_id, m);
+                    }
+                }
+                ServerEvent::OwnershipChanged { server_id } => {
+                    if let Some(server) = self.servers.get(&server_id) {
+                        let (owner, expires_at) = (server.is_owner(), server.chain().state().root_expires_at());
+                        self.root_expiry_warned.remove(&server_id);
+                        self.notice(ServerNotice::OwnershipChanged { server: self.server_name(&server_id), owner, expires_at });
                     }
                 }
                 ServerEvent::StampAttached { server_id } => tracing::debug!("Carimbo de tempo anexado em {}", community::short_id(&server_id)),

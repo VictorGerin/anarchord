@@ -108,6 +108,16 @@ pub fn parse_server_command(rest: &str) -> ServerCommand {
         "close" => Some(ServerCommand::Close),
         "open" => Some(ServerCommand::Open),
         "rotate-key" | "rotate" => Some(ServerCommand::RotateKey),
+        "key" | "chave" => {
+            let mut parts = args.split_whitespace();
+            match (parts.next(), parts.next(), parts.next()) {
+                (None | Some("show"), None, None) => Some(ServerCommand::KeyShow),
+                (Some("renew"), None, None) => Some(ServerCommand::KeyRenew),
+                (Some("transfer"), Some(target), None) => Some(ServerCommand::KeyTransfer(target.to_string())),
+                (Some("accept"), None, None) => Some(ServerCommand::KeyAccept),
+                _ => None,
+            }
+        }
         "passport" => {
             let mut parts = args.split_whitespace();
             match parts.next() {
@@ -190,6 +200,10 @@ mod tests {
         assert_eq!(parse_server_command("close"), ServerCommand::Close);
         assert_eq!(parse_server_command("open"), ServerCommand::Open);
         assert_eq!(parse_server_command("rotate-key"), ServerCommand::RotateKey);
+        assert_eq!(parse_server_command("key"), ServerCommand::KeyShow);
+        assert_eq!(parse_server_command("key renew"), ServerCommand::KeyRenew);
+        assert_eq!(parse_server_command("key transfer Bob"), ServerCommand::KeyTransfer("Bob".into()));
+        assert_eq!(parse_server_command("key accept"), ServerCommand::KeyAccept);
         assert_eq!(parse_server_command("rotate"), ServerCommand::RotateKey);
         assert_eq!(parse_server_command("history"), ServerCommand::History);
         assert_eq!(parse_server_command("bans"), ServerCommand::Bans);

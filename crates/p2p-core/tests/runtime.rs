@@ -215,7 +215,10 @@ async fn test_two_cores_server_lifecycle() {
             bob.wait("ban recusado: dono protegido", |e| matches!(e, CoreEvent::Error(CoreError::Server(m)) if m.contains("protegido"))).await;
 
             // Alice revoga o passaporte de moderador e bane Bob por 1 hora
+            // Cada alteração só vale com o carimbo de tempo: a revogação é aplicada (e chega a Bob) antes do ban
             alice.server(ServerCommand::RemoveModerator("Bob".into()));
+            alice.wait("revogação aplicada", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::ModeratorRemoved { .. }, .. }))).await;
+            bob.wait("Bob deixar de ser moderador", |e| matches!(e, CoreEvent::Server(ServerNotice::Role { moderator: false, .. }))).await;
             alice.server(ServerCommand::Ban { target: "Bob".into(), duration: Some(3600), reason: "spam".into() });
             alice.wait("ban gravado", |e| matches!(e, CoreEvent::Server(ServerNotice::Moderated { .. }))).await;
             bob.wait("Bob ser avisado do ban", |e| matches!(e, CoreEvent::Server(ServerNotice::BanStatus { banned: true, .. }))).await;

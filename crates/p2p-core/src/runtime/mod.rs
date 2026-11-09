@@ -250,6 +250,10 @@ pub(crate) struct Runtime {
     outbox_retry: HashMap<String, std::time::Instant>,
     /// Alterações deste nó aguardando carimbo: o aviso sai quando forem aplicadas
     pending_changes: HashMap<String, ServerChange>,
+    /// Última proposta de transferência da Chave do Servidor recebida (servidor e mensagem)
+    pending_transfer_offer: Option<(String, crate::community::ServerMessage)>,
+    /// Servidores cujo vencimento próximo da chave já foi avisado nesta execução
+    root_expiry_warned: std::collections::HashSet<String>,
     /// Servidor em que entra assim que a configuração chegar
     pending_switch: Option<String>,
     last_invite: Option<String>,
@@ -334,6 +338,8 @@ impl Runtime {
             last_key_package: HashMap::new(),
             outbox_retry: HashMap::new(),
             pending_changes: HashMap::new(),
+            pending_transfer_offer: None,
+            root_expiry_warned: std::collections::HashSet::new(),
             pending_switch: None,
             last_invite: None,
             last_snapshot_reply: HashMap::new(),

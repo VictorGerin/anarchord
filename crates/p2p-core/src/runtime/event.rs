@@ -286,6 +286,20 @@ pub enum ServerNotice {
     LeaderChanged { server: String, leader: Option<String>, you: bool },
     /// Chave do grupo MLS rotacionada para uma nova época
     KeyRotated { server: String, epoch: u64 },
+    /// Corrente de chaves: raízes (pubkey, desde, transferida em, vence em) e se este nó tem a chave em vigor
+    KeyChain { server: String, roots: Vec<(String, UtcSecs, Option<UtcSecs>, UtcSecs)>, mine: bool },
+    /// Renovação ou transferência pedida; vale quando o carimbo da TSA chegar
+    KeyLinkRequested { server: String, transfer: bool },
+    /// Proposta de transferência enviada a `target`
+    TransferOffered { server: String, target: String },
+    /// Proposta de transferência recebida (aceitar com `/server key accept`)
+    TransferOfferReceived { server: String, from: String },
+    /// Aceitação enviada; a chave nova foi gerada e guardada nesta máquina
+    TransferAccepted { server: String },
+    /// A posse mudou: `owner` = este nó tem agora a Chave do Servidor em vigor
+    OwnershipChanged { server: String, owner: bool, expires_at: UtcSecs },
+    /// A Chave do Servidor (deste nó) vence em breve
+    RootExpiring { server: String, expires_at: UtcSecs },
     RemovedFromGroup { server: String },
     InviteSent { server: String },
     /// Ninguém no Lobby para receber o convite: id para mandar à mão

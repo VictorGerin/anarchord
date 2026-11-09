@@ -188,6 +188,13 @@ pub fn spaces_category_menu(ctx: &MenuContext) -> Menu {
             items.push(run("🔒 Tornar privado (passaporte manual)", "/server close"));
         }
         items.push(run("📜 Histórico de alterações", "/server history"));
+        let owner = ctx.servers.iter().any(|s| s.current && s.owner);
+        let mut key_items = vec![run("🔑 Ver corrente de chaves", "/server key"), run("✅ Aceitar transferência recebida", "/server key accept")];
+        if owner {
+            key_items.insert(1, run("🔄 Renovar validade da chave", "/server key renew"));
+            key_items.insert(2, ask("🤝 Transferir a chave para…", "Nick ou pubkey do novo dono", "/server key transfer {}"));
+        }
+        items.push(MenuItem { label: "🔑 Chave do Servidor ▸".into(), action: MenuAction::Submenu(Menu::new(" Chave do Servidor ", key_items)) });
         items.push(ask("⏳ Política de passaportes…", "Validade e janela de renovação (ex.: 7d 2d)", "/server policy {}"));
         items.push(MenuItem { label: "🚪 Sair deste servidor ▸".into(), action: MenuAction::Submenu(leave_menu()) });
     } else {
