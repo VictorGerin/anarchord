@@ -59,6 +59,10 @@ struct Args {
     #[arg(long)]
     no_mdns: bool,
 
+    /// Não pede ao roteador (UPnP) que encaminhe a porta de escuta
+    #[arg(long)]
+    no_upnp: bool,
+
     /// Atende como servidor de relay (nó público)
     #[arg(long)]
     relay_server: bool,
@@ -128,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         trackers: args.tracker,
         public_defaults: !args.isolated,
         mdns: !args.no_mdns,
+        upnp: !args.no_upnp,
         relay_server: args.relay_server,
         lab: args.lab,
         sniff_file: args.sniff_file.or_else(|| Some(args.data_dir.join("packets.jsonl"))),

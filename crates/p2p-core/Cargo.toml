@@ -25,6 +25,8 @@ libp2p = { version = "0.54", features = [
     "macros",
     "request-response"
 ] }
+# UPnP IGD (#101): abre a porta de escuta no roteador. Direto, sem o libp2p-upnp 0.3 (ver src/upnp.rs)
+igd-next = { version = "0.14.3", default-features = false, features = ["aio_tokio"] }
 
 # Criptografia e Identidade (Ed25519 + X25519 + HKDF)
 ed25519-dalek = { version = "2.1", features = ["rand_core", "pkcs8", "pem"] }

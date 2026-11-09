@@ -15,6 +15,7 @@ pub mod node;
 pub mod bootstrap;
 pub mod tracker;
 pub mod relay;
+pub mod upnp;
 pub mod voice;
 pub mod file_transfer;
 pub mod screen;

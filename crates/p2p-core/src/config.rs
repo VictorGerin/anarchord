@@ -57,6 +57,8 @@ pub struct NetworkConfig {
     pub auto_bootstrap: bool,
     pub max_peers: usize,
     pub listen_port: u16,
+    /// Pede ao roteador (UPnP) que encaminhe a porta de escuta (#101). Vale na próxima inicialização
+    pub upnp: bool,
 }
 
 impl Default for NetworkConfig {
@@ -66,6 +68,7 @@ impl Default for NetworkConfig {
             auto_bootstrap: true,
             max_peers: 50,
             listen_port: 0,
+            upnp: true,
         }
     }
 }
@@ -316,6 +319,13 @@ impl NodeConfig {
                 let n: u16 = val.parse().map_err(|_| ConfigError::InvalidSetting(val.to_string()))?;
                 self.network.listen_port = n;
             }
+            "network.upnp" => {
+                self.network.upnp = match val {
+                    "true" | "1" | "on" | "sim" => true,
+                    "false" | "0" | "off" | "nao" | "não" => false,
+                    _ => return Err(ConfigError::InvalidSetting(format!("booleano inválido: {}", val))),
+                };
+            }
             "dm.allow_strangers" => {
                 self.dm.allow_strangers = match val {
                     "true" | "1" | "on" | "sim" => true,
@@ -515,8 +525,19 @@ mod tests {
         assert_eq!(migrated.mailbox.max_storage_mb, 80);
         assert_eq!(migrated.mailbox.max_message_ttl_days, 7);
         assert_eq!(migrated.network.default_channel, "geral");
+        // config.json anterior ao #101 (sem network.upnp): UPnP ligado
+        assert!(migrated.network.upnp);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_upnp_can_be_turned_off() {
+        let mut cfg = NodeConfig::default();
+        assert!(cfg.network.upnp);
+        cfg.set_key("network.upnp", "off").unwrap();
+        assert!(!cfg.network.upnp);
+        assert!(cfg.set_key("network.upnp", "talvez").is_err());
     }
 
     #[test]

@@ -338,20 +338,13 @@ impl Runtime {
             // Endereço externo confirmado: (re)anuncia na DHT para o registro carregar esse endereço
             SwarmEvent::ExternalAddrConfirmed { address } => {
                 self.emit(CoreEvent::Network(NetworkEvent::ExternalAddress(address.to_string())));
-                if self.config.discovery {
-                    self.node.dht_start_providing();
-                    for id in self.servers.list().filter(|s| s.has_chain()).map(|s| s.server_id.clone()).collect::<Vec<_>>() {
-                        self.node.dht_provide(server_dht_key(&id));
-                    }
-                    for cid in self.files.engine.providing() {
-                        self.node.dht_provide(swarm_files::dht_key(&cid));
-                    }
-                }
+                self.reannounce_dht();
             }
             SwarmEvent::Behaviour(AppBehaviourEvent::Autonat(libp2p::autonat::Event::StatusChanged { new, .. })) => match new {
                 libp2p::autonat::NatStatus::Private => {
                     self.emit(CoreEvent::Network(NetworkEvent::BehindNat));
                     self.relay_manager.set_behind_nat(true);
+                    self.on_autonat_unreachable();
                     self.request_relay_reservations();
                 }
                 libp2p::autonat::NatStatus::Public(addr) => {
@@ -360,6 +353,14 @@ impl Runtime {
                 }
                 libp2p::autonat::NatStatus::Unknown => {}
             },
+            // Sondagem em que o servidor não conseguiu discar de volta. Já atrás de NAT, o status não
+            // muda (não há `StatusChanged`), então é por aqui que se descobre que o UPnP não valeu
+            SwarmEvent::Behaviour(AppBehaviourEvent::Autonat(libp2p::autonat::Event::OutboundProbe(
+                libp2p::autonat::OutboundProbeEvent::Error {
+                    error: libp2p::autonat::OutboundProbeError::Response(libp2p::autonat::ResponseError::DialError),
+                    ..
+                },
+            ))) => self.on_autonat_unreachable(),
             SwarmEvent::Behaviour(AppBehaviourEvent::RelayClient(libp2p::relay::client::Event::ReservationReqAccepted {
                 relay_peer_id,
                 renewal,
@@ -851,8 +852,24 @@ impl Runtime {
         }
     }
 
-    /// Pede reserva nos relays candidatos que faltam (só age quando o AutoNAT indicou NAT)
-    fn request_relay_reservations(&mut self) {
+    /// (Re)anuncia na DHT os registros que carregam os endereços externos: descoberta, servidores
+    /// acompanhados e arquivos compartilhados
+    pub(super) fn reannounce_dht(&mut self) {
+        if !self.config.discovery {
+            return;
+        }
+        self.node.dht_start_providing();
+        for id in self.servers.list().filter(|s| s.has_chain()).map(|s| s.server_id.clone()).collect::<Vec<_>>() {
+            self.node.dht_provide(server_dht_key(&id));
+        }
+        for cid in self.files.engine.providing() {
+            self.node.dht_provide(swarm_files::dht_key(&cid));
+        }
+    }
+
+    /// Pede reserva nos relays candidatos que faltam (só age quando o AutoNAT indicou NAT
+    /// e não há porta encaminhada por UPnP)
+    pub(super) fn request_relay_reservations(&mut self) {
         for (relay, circuit_addr) in self.relay_manager.next_reservations() {
             match self.node.swarm.listen_on(circuit_addr.clone()) {
                 Ok(listener_id) => {

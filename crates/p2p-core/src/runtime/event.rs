@@ -226,6 +226,16 @@ pub enum NetworkEvent {
     /// Pares novos recebidos na troca de pares e discados
     PeerExchange { from: String, dialed: usize },
     AudioUnavailable(String),
+    /// Porta encaminhada no roteador por UPnP: endereços externos pelos quais o nó é alcançável direto
+    UpnpMapped(Vec<String>),
+    /// Encaminhamento UPnP perdido (renovação recusada, roteador sumiu ou trocou de IP público)
+    UpnpLost(Vec<String>),
+    /// Há roteador UPnP, mas ele não serve: sem IP público na WAN (CGNAT) ou recusou o mapeamento.
+    /// Avisado uma vez; sem roteador UPnP não há aviso
+    UpnpUnavailable(String),
+    /// Porta encaminhada, mas o AutoNAT não conseguiu discar de volta (firewall do sistema ou do
+    /// provedor): o nó volta a usar relay
+    UpnpUnreachable,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
