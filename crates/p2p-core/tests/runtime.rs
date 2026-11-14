@@ -8,7 +8,19 @@ use p2p_core::UserIdentity;
 use std::path::PathBuf;
 use std::time::Duration;
 
-const TIMEOUT: Duration = Duration::from_secs(40);
+/// Tempo máximo padrão de espera por um evento de rede/runtime nos testes de integração.
+/// Pode ser sobrescrito pela variável de ambiente `ANARCHORD_TEST_TIMEOUT_SECS` (ex.: `ANARCHORD_TEST_TIMEOUT_SECS=90`).
+/// Sob carga no Windows/debug, recomenda-se limitar a concorrência com `--test-threads=2` ou `RUST_TEST_THREADS=2`.
+const DEFAULT_TIMEOUT_SECS: u64 = 40;
+
+fn timeout() -> Duration {
+    std::env::var("ANARCHORD_TEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+}
 
 struct Peer {
     handle: CoreHandle,
@@ -30,7 +42,7 @@ impl Peer {
         if let Some(found) = self.seen.iter().find(|e| pred(e)) {
             return found.clone();
         }
-        let result = tokio::time::timeout(TIMEOUT, async {
+        let result = tokio::time::timeout(timeout(), async {
             loop {
                 let event = self.handle.next_event().await.expect("core encerrou");
                 self.seen.push(event.clone());
@@ -45,14 +57,20 @@ impl Peer {
 
     /// Como `wait`, mas só vale evento que chegou depois da posição `from` de `seen`
     async fn wait_after(&mut self, from: usize, what: &str, pred: impl Fn(&CoreEvent) -> bool) -> CoreEvent {
-        let start = std::time::Instant::now();
-        loop {
-            if let Some(found) = self.seen.iter().skip(from).find(|e| pred(e)) {
-                return found.clone();
-            }
-            assert!(start.elapsed() < TIMEOUT, "tempo esgotado esperando: {}. Eventos vistos:\n{:#?}", what, &self.seen[from..]);
-            self.drain(Duration::from_millis(200)).await;
+        if let Some(found) = self.seen.iter().skip(from).find(|e| pred(e)) {
+            return found.clone();
         }
+        let result = tokio::time::timeout(timeout(), async {
+            loop {
+                let event = self.handle.next_event().await.expect("core encerrou");
+                self.seen.push(event.clone());
+                if pred(&event) {
+                    return event;
+                }
+            }
+        })
+        .await;
+        result.unwrap_or_else(|_| panic!("tempo esgotado esperando: {}. Eventos vistos:\n{:#?}", what, &self.seen[from..]))
     }
 
     /// Estados da chave da sala enviados até agora, em ordem
@@ -247,15 +265,15 @@ async fn test_two_cores_server_lifecycle() {
             alice.server(ServerCommand::RemoveModerator("Bob".into()));
             alice.wait("revogação aplicada", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::ModeratorRemoved { .. }, .. }))).await;
             bob.wait("Bob deixar de ser moderador", |e| matches!(e, CoreEvent::Server(ServerNotice::Role { moderator: false, .. }))).await;
+            let before_ban = alice.seen.len();
             alice.server(ServerCommand::Ban { target: "Bob".into(), duration: Some(3600), reason: "spam".into() });
             alice.wait("ban gravado", |e| matches!(e, CoreEvent::Server(ServerNotice::Moderated { .. }))).await;
             bob.wait("Bob ser avisado do ban", |e| matches!(e, CoreEvent::Server(ServerNotice::BanStatus { banned: true, .. }))).await;
-            alice.drain(Duration::from_millis(300)).await;
-            let last_members = alice.seen.iter().rev().find_map(|e| match e {
-                CoreEvent::ChannelMembers { members, .. } => Some(members.clone()),
-                _ => None,
-            });
-            assert!(!last_members.unwrap_or_default().iter().any(|m| m == "Bob"), "banido não aparece na lista do canal");
+            alice
+                .wait_after(before_ban, "banido não aparece na lista do canal", |e| {
+                    matches!(e, CoreEvent::ChannelMembers { members, .. } if !members.iter().any(|m| m == "Bob"))
+                })
+                .await;
 
             // A manutenção da dona tira Bob do grupo cifrado; depois disso ele não lê mais nada
             bob.wait("Bob sair do grupo cifrado", |e| matches!(e, CoreEvent::Server(ServerNotice::RemovedFromGroup { .. }))).await;
@@ -561,6 +579,7 @@ async fn test_server_passport_issuance_acceptance_and_flattening() {
             assert!(matches!(initial_info, CoreEvent::Server(ServerNotice::PassportInfo { ref permissions, .. }) if !permissions.contains(&"Ban".to_string())));
 
             // 2. Alice promove Bob emitindo passaporte de moderador
+            let before_promote = bob.seen.len();
             alice.server(ServerCommand::IssuePassport {
                 target: "Bob".to_string(),
                 moderator: true,
@@ -568,7 +587,10 @@ async fn test_server_passport_issuance_acceptance_and_flattening() {
             });
 
             // 3. Bob recebe a oferta do novo passaporte e consulta a promoção para nível 2
-            bob.drain(Duration::from_millis(300)).await;
+            bob.wait_after(before_promote, "Bob receber passaporte de moderador", |e| {
+                matches!(e, CoreEvent::Server(ServerNotice::PassportUpdated { .. }))
+            })
+            .await;
             bob.server(ServerCommand::ShowPassport);
             let promoted_info = bob
                 .wait("Bob receber PassportInfo de moderador", |e| {
@@ -880,7 +902,6 @@ async fn test_leaving_private_server_needs_new_passport_to_return() {
 
             alice.server(ServerCommand::Close);
             alice.wait("servidor privado", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::Closed, .. }))).await;
-            carol.drain(Duration::from_millis(500)).await;
             carol.server(ServerCommand::Leave);
             carol.wait("Carol sair", |e| matches!(e, CoreEvent::Server(ServerNotice::Left { .. }))).await;
             alice
