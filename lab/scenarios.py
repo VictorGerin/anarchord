@@ -577,6 +577,7 @@ async def dm_asymmetric_firewall(lab):
     lab.step("Carol adiciona Alice como amiga: Alice é desbloqueada na hora e passa a ter cota de amiga (30 msg/min)")
     carol.send({"AddFriend": {"pubkey": alice.pubkey, "alias": "Alice"}})
     await carol.wait("FriendUpdated", where=lambda f: f["pubkey"] == alice.pubkey and not f["removed"])
+    await alice.wait("FriendRequestAccepted", where=lambda f: f["pubkey"] == carol.pubkey)
 
     since_friend = carol.mark()
     for i in range(1, 6):
