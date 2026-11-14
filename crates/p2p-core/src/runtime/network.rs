@@ -197,6 +197,7 @@ impl Runtime {
                 }
                 if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
                     self.dialed_open.insert(address.clone());
+                    self.record_peer_addr(peer_id, address.clone());
                 }
                 // A maioria das conexões é com nós do IPFS; os pares Anarchord aparecem quando o Identify confirma
                 tracing::debug!("Conexão P2P com {} via {:?}", peer_id, endpoint.get_remote_address());
@@ -229,6 +230,9 @@ impl Runtime {
                 // Registra os endereços de escuta no Swarm para permitir `dial(peer_id)` mesmo sem DHT (--no-discovery)
                 for addr in &info.listen_addrs {
                     self.node.swarm.add_peer_address(peer_id, addr.clone());
+                }
+                if let Some(addr) = pick_dialable_addr(&info.listen_addrs) {
+                    self.record_peer_addr(peer_id, addr);
                 }
                 // Alimenta a tabela de roteamento da DHT com os endereços de quem fala Kademlia
                 if info.protocols.contains(&libp2p::kad::PROTOCOL_NAME) {
@@ -886,6 +890,45 @@ impl Runtime {
     }
 }
 
+/// Seleciona o melhor `Multiaddr` discável de `listen_addrs` (ignora unspecified e prefere não-loopback).
+fn pick_dialable_addr(addrs: &[Multiaddr]) -> Option<Multiaddr> {
+    use libp2p::multiaddr::Protocol;
+    let mut fallback = None;
+    for addr in addrs {
+        let mut is_unspecified = false;
+        let mut is_loopback = false;
+        for proto in addr.iter() {
+            match proto {
+                Protocol::Ip4(ip) => {
+                    if ip.is_unspecified() {
+                        is_unspecified = true;
+                    } else if ip.is_loopback() {
+                        is_loopback = true;
+                    }
+                }
+                Protocol::Ip6(ip) => {
+                    if ip.is_unspecified() {
+                        is_unspecified = true;
+                    } else if ip.is_loopback() {
+                        is_loopback = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if is_unspecified {
+            continue;
+        }
+        if !is_loopback {
+            return Some(addr.clone());
+        }
+        if fallback.is_none() {
+            fallback = Some(addr.clone());
+        }
+    }
+    fallback
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,5 +1031,27 @@ mod tests {
             }
         }
         assert_eq!(new_events.len(), 0, "reconexão por idle timeout ao mesmo par não deve repetir HolePunched");
+    }
+
+    #[test]
+    fn test_pick_dialable_addr_prefers_non_loopback_and_skips_unspecified() {
+        let addrs: Vec<Multiaddr> = vec![
+            "/ip4/0.0.0.0/tcp/4001".parse().unwrap(),
+            "/ip4/127.0.0.1/tcp/4001".parse().unwrap(),
+            "/ip4/172.31.77.10/tcp/4001".parse().unwrap(),
+        ];
+        assert_eq!(
+            pick_dialable_addr(&addrs).unwrap().to_string(),
+            "/ip4/172.31.77.10/tcp/4001"
+        );
+
+        let only_loopback: Vec<Multiaddr> = vec![
+            "/ip4/0.0.0.0/tcp/4001".parse().unwrap(),
+            "/ip4/127.0.0.1/tcp/4001".parse().unwrap(),
+        ];
+        assert_eq!(
+            pick_dialable_addr(&only_loopback).unwrap().to_string(),
+            "/ip4/127.0.0.1/tcp/4001"
+        );
     }
 }

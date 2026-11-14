@@ -12,6 +12,7 @@ use crate::dm::{
 use crate::identity::FriendState;
 use crate::wire;
 use libp2p::gossipsub::IdentTopic;
+use libp2p::swarm::dial_opts::DialOpts;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -1039,7 +1040,14 @@ impl Runtime {
                 .gossipsub
                 .remove_blacklisted_peer(&pid);
             if !self.is_pubkey_online(&clean_pk) {
-                let _ = self.node.swarm.dial(pid);
+                if let Some(addr) = self.last_peer_addr(&pid) {
+                    let opts = DialOpts::peer_id(pid).addresses(vec![addr]).build();
+                    if self.node.swarm.dial(opts).is_err() {
+                        let _ = self.node.swarm.dial(pid);
+                    }
+                } else {
+                    let _ = self.node.swarm.dial(pid);
+                }
             }
         }
         self.dm.remove_peer_cooldown(&clean_pk);
@@ -1828,5 +1836,30 @@ mod tests {
         assert_eq!(runtime.last_invite.as_deref(), Some(server_id3.as_str()));
         let my_p = runtime.servers.get(&server_id3).and_then(|s| s.my_passport().cloned());
         assert_eq!(my_p, Some(passport), "Passaporte recebido no convite deve ser aceito automaticamente");
+    }
+
+    #[tokio::test]
+    async fn unblock_reconnect_uses_last_peer_addr_when_present() {
+        let (tx, _rx) = unbounded_channel();
+        let temp = std::env::temp_dir().join(format!("test_dm_unblock_addr_{}", rand::random::<u32>()));
+        let config = CoreConfig::new(
+            UserIdentity::generate_with_nick("Alice"),
+            temp.join("servers"),
+            temp.join("downloads"),
+        );
+        let mut runtime = Runtime::new(config, tx).unwrap();
+        let peer_id_identity = UserIdentity::generate();
+        let peer_pk = peer_id_identity.public_key_hex();
+        let pid = crate::api::peer_id_from_pubkey_hex(&peer_pk).expect("PeerId válido");
+
+        // Caminho 1: sem endereço salvo em last_peer_addr
+        assert!(runtime.last_peer_addr(&pid).is_none());
+        runtime.on_peer_unblocked(&peer_pk);
+
+        // Caminho 2: com Multiaddr salvo via record_peer_addr
+        let addr: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().expect("Multiaddr válido");
+        runtime.record_peer_addr(pid, addr.clone());
+        assert_eq!(runtime.last_peer_addr(&pid), Some(addr));
+        runtime.on_peer_unblocked(&peer_pk);
     }
 }
