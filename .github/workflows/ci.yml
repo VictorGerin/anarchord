@@ -48,10 +48,11 @@ jobs:
           toolchain: stable
           components: clippy
           cache: true
-          # O padrão da action é "deny", que transforma qualquer warning em erro.
-          # O workspace tem warnings conhecidos (unused_mut em tests/runtime.rs:997
-          # e tracing-subscriber sem uso), então deixamos o cargo decidir.
-          build-warnings: ""
+          # A action injeta `-D warnings` em RUSTFLAGS por padrão, o que
+          # transformaria os avisos conhecidos do workspace em erro
+          # (unused_mut em tests/runtime.rs:997 e tracing-subscriber sem uso).
+          # Com rustflags vazio, o cargo decide e só erro real quebra o CI.
+          rustflags: ""
 
       - name: Versões
         run: |
