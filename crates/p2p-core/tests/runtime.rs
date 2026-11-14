@@ -1039,6 +1039,11 @@ async fn test_unbanned_request_is_listed_again() {
 
             alice.seen.clear();
             alice.server(ServerCommand::Unban(carol_pk.clone()));
+            alice
+                .wait("unban aplicado", |e| {
+                    matches!(e, CoreEvent::Server(ServerNotice::ModerationReceived { kind: p2p_core::community::ModKind::Unban { .. }, .. }))
+                })
+                .await;
             let pk = carol_pk.clone();
             alice
                 .wait("Carol volta à lista depois do unban", move |e| {
