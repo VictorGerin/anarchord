@@ -1,0 +1,69 @@
+name: CI
+
+# Issue #78: check, testes do workspace e lint a cada push/PR na main.
+# Baseline local medido com Rust 1.100.0 (opus1 exige >= 1.98), 317 testes.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # A integração sobe vários nós reais em localhost; 2 threads evita contenção
+  # de portas/CPU que já causou flakiness no Windows debug (#104).
+  RUST_TEST_THREADS: "2"
+
+jobs:
+  test:
+    name: Check, testes e clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Mesmas dependências do estágio "toolchain" do Dockerfile: áudio (cpal/ALSA),
+      # captura de tela (xcap/xcb/gbm/EGL/GL), PipeWire e openh264 (nasm).
+      - name: Dependências de sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake nasm clang pkg-config \
+            libasound2-dev libxcb1-dev libxcb-randr0-dev libgbm-dev \
+            libegl1-mesa-dev libgl1-mesa-dev \
+            libpipewire-0.3-dev libspa-0.2-dev
+
+      - name: Rust estável + cache do Cargo
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+          cache: true
+          # O padrão da action é "deny", que transforma qualquer warning em erro.
+          # O workspace tem warnings conhecidos (unused_mut em tests/runtime.rs:997
+          # e tracing-subscriber sem uso), então deixamos o cargo decidir.
+          build-warnings: ""
+
+      - name: Versões
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Check do workspace (todos os alvos)
+        run: cargo check --workspace --all-targets
+
+      # RUST_TEST_THREADS=2 está no env do workflow (ver comentário acima).
+      - name: Testes do workspace (todos os alvos)
+        run: cargo test --workspace --all-targets
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
