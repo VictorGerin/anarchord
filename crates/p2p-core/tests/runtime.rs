@@ -563,12 +563,17 @@ async fn test_server_passport_issuance_acceptance_and_flattening() {
             // Bob passa a acompanhar o servidor aberto (recebe Welcome + passaporte automático de membro)
             bob.server(ServerCommand::Join(server_id.clone()));
 
-            // Bob recebe passaporte automático inicial de membro (nível 255)
+            // Bob recebe passaporte automático inicial de membro (nível 255) e entra no servidor
             bob
                 .wait("Bob receber passaporte inicial de membro", |e| {
                     matches!(e, CoreEvent::Server(ServerNotice::PassportUpdated { .. }))
                 })
                 .await;
+            let sid = server_id.clone();
+            bob.wait("Bob entrar no servidor", move |e| {
+                matches!(e, CoreEvent::ChannelEntered { space: SpaceInfo::Server { id, .. }, .. } if *id == sid)
+            })
+            .await;
 
             bob.server(ServerCommand::ShowPassport);
             let initial_info = bob
