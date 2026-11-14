@@ -996,14 +996,23 @@ impl ServerRegistry {
             return false;
         }
         // Reenvios atrasados não trocam um passaporte mais novo (ex.: o de moderador) por um antigo
+        // ou equivalente/inferior emitido no mesmo segundo
         if let Some(current) = &server.my_passport {
             let current_valid = if server.has_chain() {
                 server.chain.state().verify_passport(current, now).is_ok()
             } else {
                 current.verify_at(server_id, now).is_ok()
             };
-            if current_valid && passport.body.issued_at < current.body.issued_at {
-                return false;
+            if current_valid {
+                if passport.body.issued_at < current.body.issued_at {
+                    return false;
+                }
+                if passport.body.issued_at == current.body.issued_at
+                    && passport.body.permissions.iter().all(|p| current.body.permissions.contains(p))
+                    && passport.body.expires_at <= current.body.expires_at
+                {
+                    return false;
+                }
             }
         }
         server.set_my_passport(passport.clone());

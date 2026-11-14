@@ -226,6 +226,10 @@ impl Runtime {
                 }
             }
             SwarmEvent::Behaviour(AppBehaviourEvent::Identify(libp2p::identify::Event::Received { peer_id, info, .. })) => {
+                // Registra os endereços de escuta no Swarm para permitir `dial(peer_id)` mesmo sem DHT (--no-discovery)
+                for addr in &info.listen_addrs {
+                    self.node.swarm.add_peer_address(peer_id, addr.clone());
+                }
                 // Alimenta a tabela de roteamento da DHT com os endereços de quem fala Kademlia
                 if info.protocols.contains(&libp2p::kad::PROTOCOL_NAME) {
                     for addr in &info.listen_addrs {
@@ -450,15 +454,15 @@ impl Runtime {
 
     /// Alguém entrou num tópico: presença, keyframe para quem começou a assistir, cadeia de servidor e mailbox offline
     fn on_subscribed(&mut self, peer_id: PeerId, topic: gossipsub::TopicHash) {
+        if topic == self.active.topic.hash() {
+            self.publish_channel_members();
+        }
         let peer_pk = pubkey_hex_from_peer_id(&peer_id).unwrap_or_else(|| peer_id.to_string());
         if self.dm.firewall.is_blocked(&peer_pk, super::now_secs()) {
             return;
         }
         if topic.as_str() == crate::dm::MAILBOX_TOPIC {
             self.on_peer_subscribed_mailbox(peer_id);
-        }
-        if topic == self.active.topic.hash() {
-            self.publish_channel_members();
         }
         if self.screen.my_stream.is_some() && topic == self.screen.publish_topic.hash() {
             self.screen.engine.request_keyframe();

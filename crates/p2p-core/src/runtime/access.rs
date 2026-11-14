@@ -271,13 +271,22 @@ impl Runtime {
     }
 
     /// Governança mudou (ex.: ban desfeito): quem já está inscrito no tópico de pedidos não se
-    /// inscreve de novo, então a inscrição de cada um é reavaliada como um pedido novo
+    /// inscreve de novo, então a inscrição de cada um é reavaliada como um pedido novo e quem
+    /// ainda precisa de acesso republica o pedido sem esperar o intervalo periódico.
     pub(super) fn recheck_access_subscribers(&mut self, server_id: &str) {
-        if !self.access.subscribed.contains(server_id) || !self.can_issue_passports(server_id, super::now_secs()) {
+        let now = super::now_secs();
+        if !self.access.subscribed.contains(server_id) {
             return;
         }
+        if self.wants_access(server_id, now) {
+            self.send_access_request(server_id);
+        }
+        if !self.can_issue_passports(server_id, now) {
+            return;
+        }
+        self.access.last_request_from.retain(|(sid, _), _| sid != server_id);
         let topic = IdentTopic::new(community::access_topic(server_id)).hash();
-        let subscribers: Vec<String> = self
+        let mut subscribers: HashSet<String> = self
             .node
             .swarm
             .behaviour()
@@ -286,6 +295,13 @@ impl Runtime {
             .filter(|(_, topics)| topics.contains(&&topic))
             .filter_map(|(peer, _)| crate::api::pubkey_hex_from_peer_id(peer))
             .collect();
+        for (peer, topics) in &self.peer_topics {
+            if topics.contains(&topic) {
+                if let Some(pk) = crate::api::pubkey_hex_from_peer_id(peer) {
+                    subscribers.insert(pk);
+                }
+            }
+        }
         for pubkey in subscribers {
             self.note_access_request(server_id, &pubkey, None, false);
         }

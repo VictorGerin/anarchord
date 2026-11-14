@@ -566,11 +566,8 @@ impl Runtime {
                 }
                 let sender_pk = envelope.sender_pubkey.to_lowercase();
                 let now = super::now_secs();
-                let is_my_friend = self
-                    .identity
-                    .get_friends()
-                    .iter()
-                    .any(|f| f.public_key.eq_ignore_ascii_case(&sender_pk));
+                let is_my_friend =
+                    self.identity.get_friend_state(&sender_pk) == Some(FriendState::Confirmed);
                 let session_key = self
                     .dm
                     .sessions
@@ -855,11 +852,8 @@ impl Runtime {
                 }
 
                 let sender_pk = payload.sender_pubkey.to_lowercase();
-                let is_my_friend = self
-                    .identity
-                    .get_friends()
-                    .iter()
-                    .any(|f| f.public_key.eq_ignore_ascii_case(&sender_pk));
+                let is_my_friend =
+                    self.identity.get_friend_state(&sender_pk) == Some(FriendState::Confirmed);
                 let sender_online = self.is_pubkey_online(&sender_pk);
                 let peer_name = self
                     .identity
@@ -1044,6 +1038,9 @@ impl Runtime {
                 .behaviour_mut()
                 .gossipsub
                 .remove_blacklisted_peer(&pid);
+            if !self.is_pubkey_online(&clean_pk) {
+                let _ = self.node.swarm.dial(pid);
+            }
         }
         self.dm.remove_peer_cooldown(&clean_pk);
         let my_pk = self.identity.public_key_hex();
@@ -1232,6 +1229,13 @@ impl Runtime {
         let now = super::now_secs();
         let pending = self.dm.mailbox.pending_for_recipient(recipient_pubkey, now);
         for env in pending {
+            let msg = MailboxMessage::Deliver(env);
+            let bytes = wire::encode(&msg);
+            let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes);
+        }
+        let my_pk = self.identity.public_key_hex();
+        let outbox_pending = self.dm.mailbox.pending_outbox_for(&my_pk, recipient_pubkey);
+        for env in outbox_pending {
             let msg = MailboxMessage::Deliver(env);
             let bytes = wire::encode(&msg);
             let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes);
@@ -1467,7 +1471,7 @@ impl Runtime {
             self.delegate_pending_to_friend(&pubkey);
         }
 
-        // Também despacha via Mailbox para entrega offline garantida
+        // Também despacha via Mailbox para entrega offline garantida (e imediata se já estiver inscrito)
         if let Ok(stored) = StoredEnvelope::create_signed_and_sealed_topic(
             &self.identity,
             &pubkey,
@@ -1476,6 +1480,10 @@ impl Runtime {
             now_ms,
             None,
         ) {
+            if self.is_pubkey_online(&pubkey) {
+                let deliver = MailboxMessage::Deliver(stored.clone());
+                let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), wire::encode(&deliver));
+            }
             self.broadcast_mailbox_store(stored, Some(FRIEND_RESPONSE_MAILBOX_TOPIC));
         }
 

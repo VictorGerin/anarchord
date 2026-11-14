@@ -706,22 +706,6 @@ impl FileEngine {
                     });
                 }
             }
-            if known == 0 {
-                let wait = if known == 0 { WANT_RETRY_INTERVAL } else { WANT_INTERVAL };
-                if due(download.last_want, wait) {
-                    download.last_want = Some(now);
-                    actions.push(FileAction::Publish {
-                        topic: file_swarm_topic(&cid),
-                        message: SwarmMessage::Want { manifest: cid },
-                    });
-                }
-                if public && due(download.last_find, FIND_INTERVAL) {
-                    download.last_find = Some(now);
-                    actions.push(FileAction::FindProviders(cid));
-                }
-            }
-
-            // Timeout de descoberta quando não há fontes disponíveis (Issue #67)
             let has_source = match &entry.store {
                 None => entry.peers.values().any(|p| p.usable(now) && (p.full || p.has_any() || p.have.is_none())),
                 Some(store) => {
@@ -730,6 +714,31 @@ impl FileEngine {
                         || entry.peers.values().any(|p| p.usable(now) && store.have().missing().any(|idx| p.has(idx)))
                 }
             };
+
+            if known == 0 || !has_source {
+                let wait = if known == 0 || !has_source { WANT_RETRY_INTERVAL } else { WANT_INTERVAL };
+                if due(download.last_want, wait) {
+                    download.last_want = Some(now);
+                    actions.push(FileAction::Publish {
+                        topic: file_swarm_topic(&cid),
+                        message: SwarmMessage::Want { manifest: cid },
+                    });
+                    if !has_source && entry.store.is_some() {
+                        for info in entry.peers.values_mut() {
+                            if !info.full && info.usable(now) {
+                                info.have = None;
+                                info.asked_bitfield = false;
+                            }
+                        }
+                    }
+                }
+                if public && due(download.last_find, FIND_INTERVAL) {
+                    download.last_find = Some(now);
+                    actions.push(FileAction::FindProviders(cid));
+                }
+            }
+
+            // Timeout de descoberta quando não há fontes disponíveis (Issue #67)
 
             if !has_source {
                 let since = download.no_source_since.get_or_insert(now);

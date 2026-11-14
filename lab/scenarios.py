@@ -186,7 +186,7 @@ async def server_lifecycle(lab):
     alice.server({"Create": "Guilda"})
     created = await alice.wait("Server.Created")
     server_id = created["id"]
-    alice.server("Invite")
+    alice.server({"Invite": {"target": None, "server_id": None}})
     await alice.wait("Server.InviteSent")
     await bob.wait("InviteReceived", where=lambda i: i["server_id"] == server_id)
 
@@ -215,10 +215,12 @@ async def server_lifecycle(lab):
     await follower.wait("ChatMessage", where=lambda m: m["text"] == "nova epoca mls", timeout=20)
 
     lab.step("moderação por níveis")
-    alice.server({"AddModerator": {"target": "Bob", "level": 1}})
-    await bob.wait("Server.Role", where=lambda r: r["level"] == 1)
+    alice.server({"AddModerator": {"target": "Bob", "permissions": None}})
+    await bob.wait("Server.Role", where=lambda r: r["moderator"] is True)
     bob.server({"Ban": {"target": "Alice", "duration": None, "reason": ""}})
-    await bob.wait("Error.Server", where=lambda m: "nível igual ou superior" in m)
+    # Alice é a raiz/criadora do servidor: a cadeia recusa com Rejected(ProtectedTarget)
+    # ("o alvo é protegido (ou é a chave do servidor)"), antes da regra de ancestralidade.
+    await bob.wait("Error.Server", where=lambda m: "protegido" in m)
 
     lab.step("Alice bane Bob: ele sai do grupo cifrado e não lê mais nada")
     alice.server({"Ban": {"target": "Bob", "duration": 3600, "reason": "teste"}})
@@ -514,6 +516,9 @@ async def dm_asymmetric_firewall(lab):
     await alice.start("--no-discovery", "--connect", carol.address)
     await carol.wait("PeerIdentified", where=lambda p: p["nick"] == "Alice", desc="Carol ver Alice")
     await alice.wait("PeerIdentified", where=lambda p: p["nick"] == "Carol", desc="Alice ver Carol")
+    # Barreira de mesh: só envia DMs depois que os dois se veem em #geral, senão a
+    # primeira mensagem se perde antes do mesh Gossipsub se formar.
+    await lab.join_room("geral", alice, carol)
 
     lab.step("Assimetria: Alice adiciona Carol como amiga, mas Carol NÃO tem Alice na lista de amigos")
     alice.send({"AddFriend": {"pubkey": carol.pubkey, "alias": "Carol"}})
@@ -525,13 +530,21 @@ async def dm_asymmetric_firewall(lab):
     for i in range(1, 5):
         alice.send({"SendDm": {"target": "Carol", "text": f"oi carol {i}", "suggested_ttl": None}})
 
-    for i in range(1, 4):
-        await carol.wait(
+    # O Gossipsub entrega a rajada em qualquer ordem (no run 43598295395 chegaram 4, 3 e 2),
+    # ent�o exigimos 3 DMs distintas das 4 enviadas, sem presumir quais textos passam primeiro.
+    recebidas = set()
+    for n in range(1, 4):
+        msg = await carol.wait(
             "DirectMessage",
-            where=lambda m, i=i: m["author"] == "Alice" and m["text"] == f"oi carol {i}",
+            where=lambda m: m["author"] == "Alice"
+            and m["text"].startswith("oi carol ")
+            and m["text"] not in recebidas,
             since=since_carol,
-            desc=f"Carol receber DM {i}/3 de desconhecida",
+            desc=f"Carol receber a {n}� das 3 DMs de desconhecida antes do limite",
         )
+        recebidas.add(msg["text"])
+    if len(recebidas) != 3:
+        raise StepFailed(f"Carol deveria receber 3 DMs de Alice antes do limite: {sorted(recebidas)}")
 
     blocked = await carol.wait(
         "PeerBlocked",
@@ -590,6 +603,9 @@ async def lobby_firewall_flood(lab):
 
     await bob.wait("PeerIdentified", where=lambda p: p["nick"] == "Alice", desc="Bob ver Alice")
     await bob.wait("PeerIdentified", where=lambda p: p["nick"] == "Mallory", desc="Bob ver Mallory")
+    # Barreira de mesh: o flood só começa quando os três se veem em #geral; antes
+    # disso o Gossipsub ainda não tem mesh e nenhuma mensagem chega a Bob.
+    await lab.join_room("geral", alice, bob, mallory)
 
     lab.step("Bob configura firewall.stranger_chat_per_10s = 4")
     bob.send({"SetConfig": {"key": "firewall.stranger_chat_per_10s", "value": "4"}})
@@ -600,13 +616,21 @@ async def lobby_firewall_flood(lab):
     for i in range(1, 8):
         mallory.send({"SendMessage": f"spam lobby {i}"})
 
-    for i in range(1, 5):
-        await bob.wait(
+    # O Gossipsub entrega a rajada em qualquer ordem (no run 43587786146 chegaram 7, 6, 5 e 4),
+    # então exigimos 4 mensagens distintas de Mallory, sem presumir a ordem dos textos.
+    recebidas = set()
+    for n in range(1, 5):
+        msg = await bob.wait(
             "ChatMessage",
-            where=lambda m, i=i: m["author"] == "Mallory" and m["text"] == f"spam lobby {i}",
+            where=lambda m: m["author"] == "Mallory"
+            and m["text"].startswith("spam lobby ")
+            and m["text"] not in recebidas,
             since=since_flood,
-            desc=f"Bob receber mensagem {i}/4 antes do limite",
+            desc=f"Bob receber a {n}ª das 4 mensagens de Mallory antes do limite",
         )
+        recebidas.add(msg["text"])
+    if len(recebidas) != 4:
+        raise StepFailed(f"Bob deveria receber 4 mensagens de Mallory antes do limite: {sorted(recebidas)}")
 
     blocked = await bob.wait(
         "PeerBlocked",
@@ -637,7 +661,7 @@ async def lobby_firewall_flood(lab):
     )
 
     lab.step("Bob desbloqueia Mallory manualmente (/firewall unblock) e Mallory volta a falar")
-    bob.send({"UnblockPeer": "Mallory"})
+    bob.send({"UnblockPeer": {"target": "Mallory"}})
     await bob.wait("PeerUnblocked", where=lambda u: u["pubkey"] == mallory.pubkey, desc="Mallory desbloqueado")
 
     since_unblocked = bob.mark()
