@@ -596,8 +596,10 @@ async fn test_server_passport_issuance_acceptance_and_flattening() {
                 matches!(e, CoreEvent::Server(ServerNotice::PassportUpdated { .. }))
             })
             .await;
-            bob.wait_after(before_promote, "Bob virar moderador", |e| {
+            let sid = server_id.clone();
+            bob.wait_after(before_promote, "Bob virar moderador", move |e| {
                 matches!(e, CoreEvent::Server(ServerNotice::Role { moderator: true, .. }))
+                    || matches!(e, CoreEvent::ServersChanged(servers) if servers.iter().any(|s| s.id == sid && s.moderator))
             })
             .await;
             bob.server(ServerCommand::ShowPassport);

@@ -1230,6 +1230,13 @@ impl Runtime {
             let bytes = wire::encode(&msg);
             let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes);
         }
+        let my_pk = self.identity.public_key_hex();
+        let outbox_pending = self.dm.mailbox.pending_outbox_for(&my_pk, recipient_pubkey);
+        for env in outbox_pending {
+            let msg = MailboxMessage::Deliver(env);
+            let bytes = wire::encode(&msg);
+            let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes);
+        }
     }
 
     /// Tick periódico da Mailbox: purga envelopes expirados do disco e desbloqueios do firewall (Issue #73)
@@ -1461,7 +1468,7 @@ impl Runtime {
             self.delegate_pending_to_friend(&pubkey);
         }
 
-        // Também despacha via Mailbox para entrega offline garantida
+        // Também despacha via Mailbox para entrega offline garantida (e imediata se já estiver inscrito)
         if let Ok(stored) = StoredEnvelope::create_signed_and_sealed_topic(
             &self.identity,
             &pubkey,
@@ -1470,6 +1477,10 @@ impl Runtime {
             now_ms,
             None,
         ) {
+            if self.is_pubkey_online(&pubkey) {
+                let deliver = MailboxMessage::Deliver(stored.clone());
+                let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), wire::encode(&deliver));
+            }
             self.broadcast_mailbox_store(stored, Some(FRIEND_RESPONSE_MAILBOX_TOPIC));
         }
 
