@@ -219,6 +219,8 @@ pub(crate) struct Runtime {
     /// Melhor conexão conhecida com cada par: (endereço, relayed). O `Connected` só é emitido
     /// para pares Anarchord identificados (a maioria das conexões é com nós do IPFS na DHT)
     links: HashMap<PeerId, (String, bool)>,
+    /// Cache limitado do último Multiaddr observado por PeerId (usado por DM ao desbloquear)
+    peer_addrs: HashMap<PeerId, libp2p::Multiaddr>,
     /// PeerId -> (nick, pubkey) dos pares Anarchord identificados
     peer_metadata: HashMap<PeerId, (String, String)>,
     /// Tópicos em que cada par remoto se inscreveu: PeerId -> HashSet<TopicHash>
@@ -328,6 +330,7 @@ impl Runtime {
             node,
             connected_peers: HashSet::new(),
             links: HashMap::new(),
+            peer_addrs: HashMap::new(),
             peer_metadata: HashMap::new(),
             peer_topics: HashMap::new(),
             peer_protocols: HashMap::new(),
@@ -380,6 +383,17 @@ impl Runtime {
 
     fn my_pubkey(&self) -> String {
         self.identity.public_key_hex()
+    }
+
+    /// Registra o último `Multiaddr` conhecido de um par, mantendo o cache limitado.
+    pub(super) fn record_peer_addr(&mut self, peer_id: PeerId, addr: libp2p::Multiaddr) {
+        const MAX_PEER_ADDR_CACHE: usize = 512;
+        record_peer_addr_bounded(&mut self.peer_addrs, peer_id, addr, MAX_PEER_ADDR_CACHE);
+    }
+
+    /// Retorna o último `Multiaddr` conhecido de um par, se houver.
+    pub(super) fn last_peer_addr(&self, peer_id: &PeerId) -> Option<libp2p::Multiaddr> {
+        self.peer_addrs.get(peer_id).cloned()
     }
 
     async fn run(mut self, mut commands: UnboundedReceiver<CoreCommand>) {
@@ -818,5 +832,54 @@ impl NextEvent for libp2p::Swarm<crate::protocol::AppBehaviour> {
     async fn next_event(&mut self) -> libp2p::swarm::SwarmEvent<crate::protocol::AppBehaviourEvent> {
         use futures::StreamExt;
         self.select_next_some().await
+    }
+}
+
+fn record_peer_addr_bounded(
+    cache: &mut HashMap<PeerId, libp2p::Multiaddr>,
+    peer_id: PeerId,
+    addr: libp2p::Multiaddr,
+    max_entries: usize,
+) {
+    if max_entries == 0 {
+        return;
+    }
+    if !cache.contains_key(&peer_id) && cache.len() >= max_entries {
+        if let Some(evict_key) = cache.keys().next().cloned() {
+            cache.remove(&evict_key);
+        }
+    }
+    cache.insert(peer_id, addr);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::record_peer_addr_bounded;
+    use libp2p::{Multiaddr, PeerId};
+    use std::collections::HashMap;
+
+    #[test]
+    fn peer_addr_cache_updates_and_evicts_when_full() {
+        let mut cache = HashMap::new();
+        let p1 = PeerId::random();
+        let p2 = PeerId::random();
+        let p3 = PeerId::random();
+
+        let a1: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
+        let a1_updated: Multiaddr = "/ip4/127.0.0.1/tcp/4002".parse().unwrap();
+        let a2: Multiaddr = "/ip4/127.0.0.1/tcp/4003".parse().unwrap();
+        let a3: Multiaddr = "/ip4/127.0.0.1/tcp/4004".parse().unwrap();
+
+        record_peer_addr_bounded(&mut cache, p1, a1, 2);
+        record_peer_addr_bounded(&mut cache, p1, a1_updated.clone(), 2);
+        assert_eq!(cache.get(&p1), Some(&a1_updated));
+        assert_eq!(cache.len(), 1);
+
+        record_peer_addr_bounded(&mut cache, p2, a2.clone(), 2);
+        assert_eq!(cache.len(), 2);
+
+        record_peer_addr_bounded(&mut cache, p3, a3.clone(), 2);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(&p3), Some(&a3));
     }
 }
