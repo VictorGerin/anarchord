@@ -530,13 +530,21 @@ async def dm_asymmetric_firewall(lab):
     for i in range(1, 5):
         alice.send({"SendDm": {"target": "Carol", "text": f"oi carol {i}", "suggested_ttl": None}})
 
-    for i in range(1, 4):
-        await carol.wait(
+    # O Gossipsub entrega a rajada em qualquer ordem (no run 43598295395 chegaram 4, 3 e 2),
+    # ent�o exigimos 3 DMs distintas das 4 enviadas, sem presumir quais textos passam primeiro.
+    recebidas = set()
+    for n in range(1, 4):
+        msg = await carol.wait(
             "DirectMessage",
-            where=lambda m, i=i: m["author"] == "Alice" and m["text"] == f"oi carol {i}",
+            where=lambda m: m["author"] == "Alice"
+            and m["text"].startswith("oi carol ")
+            and m["text"] not in recebidas,
             since=since_carol,
-            desc=f"Carol receber DM {i}/3 de desconhecida",
+            desc=f"Carol receber a {n}� das 3 DMs de desconhecida antes do limite",
         )
+        recebidas.add(msg["text"])
+    if len(recebidas) != 3:
+        raise StepFailed(f"Carol deveria receber 3 DMs de Alice antes do limite: {sorted(recebidas)}")
 
     blocked = await carol.wait(
         "PeerBlocked",
@@ -653,7 +661,7 @@ async def lobby_firewall_flood(lab):
     )
 
     lab.step("Bob desbloqueia Mallory manualmente (/firewall unblock) e Mallory volta a falar")
-    bob.send({"UnblockPeer": "Mallory"})
+    bob.send({"UnblockPeer": {"target": "Mallory"}})
     await bob.wait("PeerUnblocked", where=lambda u: u["pubkey"] == mallory.pubkey, desc="Mallory desbloqueado")
 
     since_unblocked = bob.mark()

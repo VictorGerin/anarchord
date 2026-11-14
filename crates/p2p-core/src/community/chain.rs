@@ -450,33 +450,57 @@ impl ServerState {
     /// carimbos; ao aplicar, o tempo vira o verificado pela política da época (se for maior,
     /// o evento volta para a fila na posição certa).
     fn apply_all(&mut self, events: &BTreeMap<String, GovEvent>) {
-        let mut queue: BinaryHeap<Reverse<(UtcSecs, String)>> = BinaryHeap::new();
+        let priority = |entry: &Entry| -> u8 {
+            if matches!(entry, Entry::SetTimestampPolicy(_)) { 1 } else { 0 }
+        };
+        let mut queue: BinaryHeap<Reverse<(UtcSecs, u8, String)>> = BinaryHeap::new();
         for (id, event) in events {
             match event.declared_time() {
-                Some(t) => queue.push(Reverse((t, id.clone()))),
+                Some(t) => queue.push(Reverse((t, priority(&event.body.entry), id.clone()))),
                 None => {
                     self.rejected_actions.insert(id.clone(), Rejection::NoTimestamp);
                 }
             }
         }
         let mut requeued = BTreeSet::new();
-        while let Some(Reverse((t, id))) = queue.pop() {
-            let event = &events[&id];
-            match self.event_time(event) {
-                None => {
-                    self.rejected_actions.insert(id, Rejection::NoTimestamp);
-                }
-                Some(verified) if verified > t && requeued.insert(id.clone()) => queue.push(Reverse((verified, id))),
-                Some(verified) => match {
-                    self.apply_transfers_until(verified.saturating_sub(1));
-                    self.check_event(event, verified)
-                } {
-                    Ok(()) => self.apply_entry(event, verified),
-                    Err(rejection) => {
-                        self.rejected_actions.insert(id, rejection);
+        let mut deferred_unbans: Vec<(UtcSecs, String)> = Vec::new();
+        let mut any_applied = true;
+        while any_applied {
+            any_applied = false;
+            while let Some(Reverse((t, _, id))) = queue.pop() {
+                let event = &events[&id];
+                match self.event_time(event) {
+                    None => {
+                        self.rejected_actions.insert(id, Rejection::NoTimestamp);
                     }
-                },
+                    Some(verified) if verified > t && requeued.insert(id.clone()) => {
+                        queue.push(Reverse((verified, priority(&event.body.entry), id)));
+                    }
+                    Some(verified) => match {
+                        self.apply_transfers_until(verified.saturating_sub(1));
+                        self.check_event(event, verified)
+                    } {
+                        Ok(()) => {
+                            self.apply_entry(event, verified);
+                            any_applied = true;
+                        }
+                        Err(Rejection::NotBanAuthor) => {
+                            deferred_unbans.push((verified, id));
+                        }
+                        Err(rejection) => {
+                            self.rejected_actions.insert(id, rejection);
+                        }
+                    },
+                }
             }
+            if any_applied && !deferred_unbans.is_empty() {
+                for (verified, id) in deferred_unbans.drain(..) {
+                    queue.push(Reverse((verified, 0, id)));
+                }
+            }
+        }
+        for (_, id) in deferred_unbans {
+            self.rejected_actions.insert(id, Rejection::NotBanAuthor);
         }
         self.apply_transfers_until(UtcSecs::MAX);
     }
