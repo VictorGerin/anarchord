@@ -109,10 +109,7 @@ pub extern "C" fn p2p_ffi_free_buffer(buf: FfiByteBuffer) {
 /// Permite que ambientes externos aloquem um buffer na heap do Rust.
 #[no_mangle]
 pub extern "C" fn p2p_ffi_alloc_buffer(size: usize) -> FfiByteBuffer {
-    let mut vec = Vec::with_capacity(size);
-    unsafe {
-        vec.set_len(size);
-    }
+    let vec = vec![0u8; size];
     FfiByteBuffer::from_vec(vec)
 }
 

@@ -1,0 +1,76 @@
+name: Anarchlab
+
+# Issue #78: sobe o laboratório Docker (NAT, tracker, relay) e publica os logs.
+# O build release dentro do contêiner é o passo caro; rode sob demanda quando puder.
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: "Filtros de cenário separados por espaço (vazio = todos). Ex.: chat file"
+        required: false
+        default: ""
+        type: string
+
+  push:
+    branches: [main]
+    paths:
+      - "lab/**"
+      - "Dockerfile"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+concurrency:
+  group: lab-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  lab:
+    name: Cenários do laboratório
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # O build release do workspace + 8 camadas de imagem cabem apertado nos ~14 GB
+      # do runner; remover toolchains pré-instaladas evita "no space left on device".
+      - name: Liberar espaço em disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Docker e Python disponíveis
+        run: |
+          docker version
+          docker compose version
+          python --version
+
+      # lab/run.py compila os binários Linux num contêiner, monta a imagem e roda
+      # cada cenário; grava lab/results/<cenário>/events.log.
+      - name: Cenários do Anarchlab
+        env:
+          SCENARIOS: ${{ inputs.scenarios }}
+        run: python lab/run.py $SCENARIOS
+
+      # if: always() garante os logs mesmo quando um cenário falha ou o passo acima é
+      # interrompido; sem isso a falha mais interessante ficaria sem evidência.
+      - name: Upload dos resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anarchlab-results-${{ github.run_id }}
+          path: lab/results/
+          if-no-files-found: warn
+          retention-days: 14
