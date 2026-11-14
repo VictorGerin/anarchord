@@ -1038,6 +1038,9 @@ impl Runtime {
                 .behaviour_mut()
                 .gossipsub
                 .remove_blacklisted_peer(&pid);
+            if !self.is_pubkey_online(&clean_pk) {
+                let _ = self.node.swarm.dial(pid);
+            }
         }
         self.dm.remove_peer_cooldown(&clean_pk);
         let my_pk = self.identity.public_key_hex();
