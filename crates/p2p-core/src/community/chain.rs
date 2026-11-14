@@ -548,7 +548,7 @@ impl ServerState {
         }
         match &event.body.entry {
             Entry::Renounce { serial } if serial != &passport.body.serial => return Err(Rejection::NotOwnPassport),
-            Entry::Unban { target } if !self.bans.get(target).is_some_and(|bans| bans.iter().any(|b| b.by == actor && b.starts_at <= at)) => {
+            Entry::Unban { target } if !self.bans.get(target).is_some_and(|bans| bans.iter().any(|b| b.by == actor)) => {
                 return Err(Rejection::NotBanAuthor);
             }
             Entry::Consolidate(consolidation) if consolidation.generation != self.generation + 1 => {
@@ -602,7 +602,7 @@ impl ServerState {
             }
             Entry::Unban { target } => {
                 if let Some(list) = self.bans.get_mut(target) {
-                    list.retain(|b| !(b.by == actor && b.starts_at <= at));
+                    list.retain(|b| b.by != actor);
                     if list.is_empty() {
                         self.bans.remove(target);
                     }

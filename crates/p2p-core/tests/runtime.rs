@@ -596,6 +596,10 @@ async fn test_server_passport_issuance_acceptance_and_flattening() {
                 matches!(e, CoreEvent::Server(ServerNotice::PassportUpdated { .. }))
             })
             .await;
+            bob.wait_after(before_promote, "Bob virar moderador", |e| {
+                matches!(e, CoreEvent::Server(ServerNotice::Role { moderator: true, .. }))
+            })
+            .await;
             bob.server(ServerCommand::ShowPassport);
             let promoted_info = bob
                 .wait("Bob receber PassportInfo de moderador", |e| {
@@ -895,6 +899,7 @@ async fn test_leaving_private_server_needs_new_passport_to_return() {
             let (mut carol, carol_task) = start("Carol", Some(alice_port));
             tokio::task::spawn_local(carol_task.run());
             alice.wait("Alice identificar Carol", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Carol")).await;
+            carol.wait("Carol identificar Alice", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Alice")).await;
             alice.server(ServerCommand::Create("Clube".into()));
             let CoreEvent::Server(ServerNotice::Created { id, .. }) =
                 alice.wait("servidor criado", |e| matches!(e, CoreEvent::Server(ServerNotice::Created { .. }))).await
@@ -1023,7 +1028,7 @@ async fn test_unbanned_request_is_listed_again() {
                 })
                 .await;
 
-            alice.server(ServerCommand::Ban { target: carol_pk.clone(), duration: None, reason: String::new() });
+            alice.server(ServerCommand::Ban { target: carol_pk.clone(), duration: Some(3600), reason: String::new() });
             alice.wait("ban gravado", |e| matches!(e, CoreEvent::Server(ServerNotice::Moderated { .. }))).await;
             alice
                 .wait("ban aplicado", |e| {
@@ -1116,6 +1121,7 @@ async fn test_access_request_with_proof_of_work_via_witness() {
             let (mut carol, carol_task) = start("Carol", Some(alice_port));
             tokio::task::spawn_local(carol_task.run());
             alice.wait("Alice identificar Carol", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Carol")).await;
+            carol.wait("Carol identificar Alice", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Alice")).await;
             alice.server(ServerCommand::Create("Forte".into()));
             let CoreEvent::Server(ServerNotice::Created { id, .. }) =
                 alice.wait("servidor criado", |e| matches!(e, CoreEvent::Server(ServerNotice::Created { .. }))).await

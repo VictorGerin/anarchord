@@ -566,11 +566,8 @@ impl Runtime {
                 }
                 let sender_pk = envelope.sender_pubkey.to_lowercase();
                 let now = super::now_secs();
-                let is_my_friend = self
-                    .identity
-                    .get_friends()
-                    .iter()
-                    .any(|f| f.public_key.eq_ignore_ascii_case(&sender_pk));
+                let is_my_friend =
+                    self.identity.get_friend_state(&sender_pk) == Some(FriendState::Confirmed);
                 let session_key = self
                     .dm
                     .sessions
@@ -855,11 +852,8 @@ impl Runtime {
                 }
 
                 let sender_pk = payload.sender_pubkey.to_lowercase();
-                let is_my_friend = self
-                    .identity
-                    .get_friends()
-                    .iter()
-                    .any(|f| f.public_key.eq_ignore_ascii_case(&sender_pk));
+                let is_my_friend =
+                    self.identity.get_friend_state(&sender_pk) == Some(FriendState::Confirmed);
                 let sender_online = self.is_pubkey_online(&sender_pk);
                 let peer_name = self
                     .identity

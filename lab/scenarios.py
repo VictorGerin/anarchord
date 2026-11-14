@@ -608,13 +608,21 @@ async def lobby_firewall_flood(lab):
     for i in range(1, 8):
         mallory.send({"SendMessage": f"spam lobby {i}"})
 
-    for i in range(1, 5):
-        await bob.wait(
+    # O Gossipsub entrega a rajada em qualquer ordem (no run 43587786146 chegaram 7, 6, 5 e 4),
+    # então exigimos 4 mensagens distintas de Mallory, sem presumir a ordem dos textos.
+    recebidas = set()
+    for n in range(1, 5):
+        msg = await bob.wait(
             "ChatMessage",
-            where=lambda m, i=i: m["author"] == "Mallory" and m["text"] == f"spam lobby {i}",
+            where=lambda m: m["author"] == "Mallory"
+            and m["text"].startswith("spam lobby ")
+            and m["text"] not in recebidas,
             since=since_flood,
-            desc=f"Bob receber mensagem {i}/4 antes do limite",
+            desc=f"Bob receber a {n}ª das 4 mensagens de Mallory antes do limite",
         )
+        recebidas.add(msg["text"])
+    if len(recebidas) != 4:
+        raise StepFailed(f"Bob deveria receber 4 mensagens de Mallory antes do limite: {sorted(recebidas)}")
 
     blocked = await bob.wait(
         "PeerBlocked",
