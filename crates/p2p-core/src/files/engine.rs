@@ -189,12 +189,24 @@ pub struct FileEngine {
     partial_dir: PathBuf,
     download_dir: PathBuf,
     files: HashMap<Cid, Entry>,
+    download_limiter: crate::config::SharedBandwidthLimiter,
 }
 
 impl FileEngine {
     /// `partial_dir` guarda downloads em andamento; `download_dir` recebe os arquivos completos
     pub fn new(partial_dir: PathBuf, download_dir: PathBuf) -> Self {
-        Self { partial_dir, download_dir, files: HashMap::new() }
+        Self {
+            partial_dir,
+            download_dir,
+            files: HashMap::new(),
+            download_limiter: crate::config::SharedBandwidthLimiter::with_min_burst(0, super::PIECE_SIZE as u64),
+        }
+    }
+
+    /// Configura um limitador de banda de download compartilhado
+    pub fn with_download_limiter(mut self, limiter: crate::config::SharedBandwidthLimiter) -> Self {
+        self.download_limiter = limiter;
+        self
     }
 
     /// Diretório onde os downloads completos são salvos (`download_dir`)
@@ -820,6 +832,7 @@ impl FileEngine {
         let Entry { store, download, peers, .. } = entry;
         let Some(download) = download.as_mut() else { return Vec::new() };
         let mut actions = Vec::new();
+        let limiter = &self.download_limiter;
 
         let Some(store) = store.as_ref() else {
             let previous = download.manifest_request.map(|(p, _)| p);
@@ -837,17 +850,23 @@ impl FileEngine {
                     .filter(|(_, p)| p.usable(now) && (p.full || p.has_any() || p.have.is_none()))
                     .min_by_key(|(id, p)| (Some(**id) == previous, !p.full, !p.has_any()))
                     .map(|(id, _)| *id);
-                download.manifest_request = candidate.map(|p| (p, now));
                 if let Some(peer) = candidate {
-                    actions.push(FileAction::Request { peer, request: FileRequest::GetManifest { cid: *cid } });
+                    if limiter.try_consume(1024) {
+                        download.manifest_request = Some((peer, now));
+                        actions.push(FileAction::Request { peer, request: FileRequest::GetManifest { cid: *cid } });
+                    }
                 }
             }
             return actions;
         };
 
         // Pares que ainda não disseram o que têm
+        let bitfield_cost = (store.manifest().piece_count() as u64).div_ceil(8).max(1);
         for (id, info) in peers.iter_mut() {
             if !info.full && info.have.is_none() && !info.asked_bitfield && info.usable(now) {
+                if !limiter.try_consume(bitfield_cost) {
+                    break;
+                }
                 info.asked_bitfield = true;
                 actions.push(FileAction::Request { peer: *id, request: FileRequest::GetBitfield { cid: *cid } });
             }
@@ -888,6 +907,10 @@ impl FileEngine {
                 .min_by_key(|(_, p)| p.inflight)
                 .map(|(id, _)| *id);
             if let Some(peer) = peer {
+                let cost = store.manifest().piece_len(index);
+                if !limiter.try_consume(cost) {
+                    break;
+                }
                 peers.get_mut(&peer).expect("escolhido acima").inflight += 1;
                 download.inflight.insert(index, (peer, now));
                 actions.push(FileAction::Request { peer, request: FileRequest::GetPiece { cid: *cid, index } });
@@ -1387,5 +1410,53 @@ mod tests {
         }
 
         assert_eq!(net.nodes[1].engine.list(net.now)[0].state, FileState::Offered);
+    }
+
+    #[test]
+    fn download_limiter_unlimited_and_hot_reload() {
+        let dir = temp_dir("bw_unlimited");
+        let limiter = crate::config::SharedBandwidthLimiter::with_min_burst(0, super::super::PIECE_SIZE as u64);
+        assert!(limiter.is_unlimited());
+        assert!(limiter.try_consume(super::super::PIECE_SIZE as u64 * 4));
+
+        let mut engine = FileEngine::new(dir.join("p"), dir.join("d"))
+            .with_download_limiter(limiter.clone());
+        assert!(engine.tick(Instant::now()).is_empty());
+
+        // Hot-reload para 128 KB/s (abaixo de PIECE_SIZE, mas min_burst = 256 KiB permite 1 chunk)
+        limiter.update_rate_kbps(128);
+        assert!(!limiter.is_unlimited());
+        assert!(limiter.try_consume(super::super::PIECE_SIZE as u64));
+        assert!(!limiter.try_consume(1024));
+    }
+
+    #[test]
+    fn download_pacing_defers_without_false_timeout() {
+        let dir = temp_dir("bw_pacing");
+        let limiter = crate::config::SharedBandwidthLimiter::with_min_burst(1, super::super::PIECE_SIZE as u64);
+        // Esgota o balde antes de agendar
+        assert!(limiter.try_consume(super::super::PIECE_SIZE as u64));
+
+        let mut engine = FileEngine::new(dir.join("p"), dir.join("d"))
+            .with_download_limiter(limiter.clone());
+        let alice = PeerId::random();
+        let now = Instant::now();
+        let offer = OfferInfo {
+            manifest: Cid::of(b"manifest-bytes"),
+            name: "video.bin".into(),
+            size: super::super::PIECE_SIZE as u64 * 2,
+            publisher: String::new(),
+            publisher_name: "Alice".into(),
+            key: None,
+        };
+        engine.on_gossip(alice, TOPIC, SwarmMessage::Offer(offer.clone()), now);
+        let actions = engine.get(&offer.manifest.to_string(), now).unwrap();
+        // Sem saldo no balde, GetManifest é adiado sem iniciar manifest_request/timeout
+        assert!(!actions.iter().any(|a| matches!(a, FileAction::Request { .. })));
+
+        // Hot-reload para ilimitado e tick seguinte agenda imediatamente
+        limiter.update_rate_kbps(0);
+        let actions = engine.tick(now + Duration::from_secs(1));
+        assert!(actions.iter().any(|a| matches!(a, FileAction::Request { request: FileRequest::GetManifest { .. }, .. })));
     }
 }

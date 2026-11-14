@@ -8,9 +8,9 @@ use crate::identity::UserIdentity;
 use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::PeerId;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// Manifesto montado em segundo plano, pronto para compartilhar
@@ -31,9 +31,29 @@ fn clean_watch_path(path: &Path) -> PathBuf {
     }
 }
 
+const UPLOAD_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct PendingUpload {
+    channel: request_response::ResponseChannel<swarm_files::FileResponse>,
+    response: swarm_files::FileResponse,
+    bytes: u64,
+    enqueued_at: Instant,
+}
+
+fn response_byte_len(response: &swarm_files::FileResponse) -> u64 {
+    match response {
+        swarm_files::FileResponse::Piece(b)
+        | swarm_files::FileResponse::Manifest(b)
+        | swarm_files::FileResponse::Bitfield(b) => b.len() as u64,
+        swarm_files::FileResponse::Ok | swarm_files::FileResponse::Busy | swarm_files::FileResponse::NotFound => 0,
+    }
+}
+
 pub(super) struct FilesState {
     pub(super) engine: FileEngine,
     requests: HashMap<OutboundRequestId, (PeerId, FileRequest)>,
+    upload_limiter: crate::config::SharedBandwidthLimiter,
+    pending_uploads: VecDeque<PendingUpload>,
     /// Salas em que o nó se inscreveu por causa de downloads
     followed: HashSet<String>,
     tx: UnboundedSender<ManifestJob>,
@@ -46,7 +66,12 @@ pub(super) struct FilesState {
 }
 
 impl FilesState {
-    pub(super) fn new(identity: &UserIdentity, download_dir: PathBuf) -> Self {
+    pub(super) fn new(
+        identity: &UserIdentity,
+        download_dir: PathBuf,
+        download_limiter: crate::config::SharedBandwidthLimiter,
+        upload_limiter: crate::config::SharedBandwidthLimiter,
+    ) -> Self {
         // Parciais separados por identidade: vários nós na mesma máquina não se misturam
         let partial_dir = download_dir.join(".parcial").join(&identity.public_key_hex()[..8]);
         let _ = std::fs::create_dir_all(&download_dir);
@@ -78,8 +103,10 @@ impl FilesState {
         };
 
         Self {
-            engine: FileEngine::new(partial_dir, download_dir),
+            engine: FileEngine::new(partial_dir, download_dir).with_download_limiter(download_limiter),
             requests: HashMap::new(),
+            upload_limiter,
+            pending_uploads: VecDeque::new(),
             followed: Default::default(),
             tx,
             manifests: Some(rx),
@@ -217,9 +244,37 @@ impl Runtime {
     }
 
     pub(super) fn files_tick(&mut self) {
+        let now = Instant::now();
+        self.drain_pending_uploads(now);
         self.sync_swarm_topics();
-        let actions = self.files.engine.tick(Instant::now());
+        let actions = self.files.engine.tick(now);
         self.apply_file_actions(actions);
+    }
+
+    fn drain_pending_uploads(&mut self, now: Instant) {
+        while let Some(front) = self.files.pending_uploads.front() {
+            if now.duration_since(front.enqueued_at) >= UPLOAD_QUEUE_TIMEOUT {
+                let item = self.files.pending_uploads.pop_front().unwrap();
+                let _ = self
+                    .node
+                    .swarm
+                    .behaviour_mut()
+                    .files
+                    .send_response(item.channel, swarm_files::FileResponse::Busy);
+                continue;
+            }
+            if self.files.upload_limiter.try_consume(front.bytes) {
+                let item = self.files.pending_uploads.pop_front().unwrap();
+                let _ = self
+                    .node
+                    .swarm
+                    .behaviour_mut()
+                    .files
+                    .send_response(item.channel, item.response);
+            } else {
+                break;
+            }
+        }
     }
 
     /// Pedidos de outros pares e respostas aos nossos pelo protocolo de arquivos
@@ -262,7 +317,20 @@ impl Runtime {
                         room.is_some_and(|room| requester.as_ref().is_some_and(|pk| mls.members(&room).contains(pk)))
                     };
                     let (response, actions) = self.files.engine.handle_request(peer, request, &allow, now);
-                    let _ = self.node.swarm.behaviour_mut().files.send_response(channel, response);
+                    let cost = response_byte_len(&response);
+                    if cost == 0
+                        || self.files.upload_limiter.is_unlimited()
+                        || (self.files.pending_uploads.is_empty() && self.files.upload_limiter.try_consume(cost))
+                    {
+                        let _ = self.node.swarm.behaviour_mut().files.send_response(channel, response);
+                    } else {
+                        self.files.pending_uploads.push_back(PendingUpload {
+                            channel,
+                            response,
+                            bytes: cost,
+                            enqueued_at: now,
+                        });
+                    }
                     actions
                 }
                 request_response::Message::Response { request_id, response } => match self.files.requests.remove(&request_id) {
