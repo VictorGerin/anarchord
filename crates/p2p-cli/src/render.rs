@@ -631,12 +631,27 @@ fn friends(list: &[FriendStatus]) -> Vec<String> {
     lines
 }
 
+fn fmt_bandwidth_rate(rate_kbps: u64) -> String {
+    if rate_kbps == 0 {
+        "ilimitado (0)".to_string()
+    } else {
+        format!("{} KB/s", rate_kbps)
+    }
+}
+
 fn config_status(cfg: &NodeConfig, used_bytes: u64, envelope_count: usize) -> Vec<String> {
     let mb = &cfg.mailbox;
     let net = &cfg.network;
     let dm = &cfg.dm;
+    let bw = &cfg.bandwidth;
     vec![
         "⚙️ Configuração do Nó (/config set <chave> <valor>):".to_string(),
+        format!(
+            "   bandwidth.max_download_rate = {} | bandwidth.max_upload_rate = {} | bandwidth.max_global_rate = {}",
+            fmt_bandwidth_rate(bw.max_download_rate),
+            fmt_bandwidth_rate(bw.max_upload_rate),
+            fmt_bandwidth_rate(bw.max_global_rate),
+        ),
         format!(
             "   mailbox.enabled = {} | mailbox.max_message_ttl_days = {} | mailbox.max_envelope_size_kb = {}",
             mb.enabled, mb.max_message_ttl_days, mb.max_envelope_size_kb
@@ -757,5 +772,22 @@ mod tests {
         assert_eq!(fmt_utc(1_798_000_000), "2026-12-23 04:26 UTC");
         assert_eq!(human_size(3 * 1024 * 1024 + 300_000), "3.3 MB");
         assert_eq!(human_size(512), "512 B");
+    }
+
+    #[test]
+    fn test_config_status_bandwidth_formatting() {
+        let mut cfg = NodeConfig::default();
+        let unlimited = config_status(&cfg, 0, 0).join("\n");
+        assert!(unlimited.contains("bandwidth.max_download_rate = ilimitado (0)"), "{}", unlimited);
+        assert!(unlimited.contains("bandwidth.max_upload_rate = ilimitado (0)"), "{}", unlimited);
+        assert!(unlimited.contains("bandwidth.max_global_rate = ilimitado (0)"), "{}", unlimited);
+
+        cfg.bandwidth.max_download_rate = 512;
+        cfg.bandwidth.max_upload_rate = 256;
+        cfg.bandwidth.max_global_rate = 2048;
+        let limited = config_status(&cfg, 0, 0).join("\n");
+        assert!(limited.contains("bandwidth.max_download_rate = 512 KB/s"), "{}", limited);
+        assert!(limited.contains("bandwidth.max_upload_rate = 256 KB/s"), "{}", limited);
+        assert!(limited.contains("bandwidth.max_global_rate = 2048 KB/s"), "{}", limited);
     }
 }

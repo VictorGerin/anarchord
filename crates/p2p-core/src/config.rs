@@ -153,6 +153,189 @@ impl Default for FirewallConfig {
     }
 }
 
+/// Configuração de limitação de taxa de banda (`KB/s`, onde `1 KB/s = 1024 bytes/s`, `0` = ilimitado)
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct BandwidthConfig {
+    /// Limite de download de arquivos no enxame em KB/s (`0` = ilimitado)
+    pub max_download_rate: u64,
+    /// Limite de upload de arquivos no enxame em KB/s (`0` = ilimitado)
+    pub max_upload_rate: u64,
+    /// Limite global de tráfego (ingress/egress) em KB/s (`0` = ilimitado)
+    pub max_global_rate: u64,
+}
+
+/// Faz o parse de uma taxa de banda em `KB/s` (`1 KB/s = 1024 bytes/s`).
+/// Aceita `"0"`, `"ilimite"`, `"ilimitado"`, `"unlimited"`, inteiros (`"512"`)
+/// e sufixos (`"500KB"`, `"500KB/s"`, `"2MB"`, `"2MB/s"`, case-insensitive).
+pub fn parse_bandwidth_rate(raw: &str) -> Result<u64, ConfigError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::InvalidSetting("taxa de banda não pode ser vazia".into()));
+    }
+    if trimmed.starts_with('-') {
+        return Err(ConfigError::InvalidSetting(format!("taxa de banda não pode ser negativa: {}", trimmed)));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(lower.as_str(), "0" | "ilimite" | "ilimitado" | "unlimited") {
+        return Ok(0);
+    }
+    let (num_str, mult) = if let Some(s) = lower.strip_suffix("mb/s").or_else(|| lower.strip_suffix("mib/s")).or_else(|| lower.strip_suffix("mb")).or_else(|| lower.strip_suffix("mib")) {
+        (s.trim(), 1024u64)
+    } else if let Some(s) = lower.strip_suffix("kb/s").or_else(|| lower.strip_suffix("kib/s")).or_else(|| lower.strip_suffix("kb")).or_else(|| lower.strip_suffix("kib")) {
+        (s.trim(), 1u64)
+    } else {
+        (lower.as_str(), 1u64)
+    };
+    let n: u64 = num_str.parse().map_err(|_| {
+        ConfigError::InvalidSetting(format!(
+            "taxa de banda inválida: {} (use inteiro em KB/s, 0/ilimitado, ou sufixos KB, KB/s, MB, MB/s)",
+            trimmed
+        ))
+    })?;
+    Ok(n.saturating_mul(mult))
+}
+
+const DEFAULT_MIN_BURST_BYTES: u64 = 16 * 1024;
+
+/// Balde de fichas (*token bucket*) para limitação de taxa em bytes/s (`0` = ilimitado).
+#[derive(Debug, Clone)]
+pub struct TokenBucket {
+    rate_kbps: u64,
+    rate_bytes_per_sec: u64,
+    min_burst: u64,
+    capacity: f64,
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+impl TokenBucket {
+    pub fn new(rate_kbps: u64) -> Self {
+        Self::with_min_burst(rate_kbps, DEFAULT_MIN_BURST_BYTES)
+    }
+
+    pub fn with_min_burst(rate_kbps: u64, min_burst: u64) -> Self {
+        let rate_bytes_per_sec = rate_kbps.saturating_mul(1024);
+        let capacity = if rate_bytes_per_sec == 0 {
+            0.0
+        } else {
+            min_burst.max(rate_bytes_per_sec) as f64
+        };
+        Self {
+            rate_kbps,
+            rate_bytes_per_sec,
+            min_burst,
+            capacity,
+            tokens: capacity,
+            last_refill: std::time::Instant::now(),
+        }
+    }
+
+    pub fn rate_kbps(&self) -> u64 {
+        self.rate_kbps
+    }
+
+    pub fn is_unlimited(&self) -> bool {
+        self.rate_kbps == 0
+    }
+
+    pub fn update_rate_kbps(&mut self, rate_kbps: u64) {
+        self.refill();
+        let was_unlimited = self.rate_bytes_per_sec == 0;
+        self.rate_kbps = rate_kbps;
+        self.rate_bytes_per_sec = rate_kbps.saturating_mul(1024);
+        if self.rate_bytes_per_sec == 0 {
+            self.capacity = 0.0;
+            self.tokens = 0.0;
+        } else {
+            self.capacity = self.min_burst.max(self.rate_bytes_per_sec) as f64;
+            if was_unlimited || self.tokens > self.capacity {
+                self.tokens = self.capacity;
+            }
+        }
+    }
+
+    fn refill(&mut self) {
+        let now = std::time::Instant::now();
+        if self.rate_bytes_per_sec > 0 {
+            let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+            self.tokens = (self.tokens + elapsed * self.rate_bytes_per_sec as f64).min(self.capacity);
+        }
+        self.last_refill = now;
+    }
+
+    /// Tenta consumir `bytes` imediatamente sem aguardar.
+    pub fn try_consume(&mut self, bytes: u64) -> bool {
+        if self.is_unlimited() || bytes == 0 {
+            return true;
+        }
+        self.refill();
+        let needed = bytes as f64;
+        if self.tokens >= needed {
+            self.tokens -= needed;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reserva `bytes` e retorna o tempo que o chamador deve aguardar caso o saldo fique negativo.
+    pub fn reserve(&mut self, bytes: u64) -> std::time::Duration {
+        if self.is_unlimited() || bytes == 0 {
+            return std::time::Duration::ZERO;
+        }
+        self.refill();
+        self.tokens -= bytes as f64;
+        if self.tokens >= 0.0 {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs_f64((-self.tokens) / self.rate_bytes_per_sec as f64)
+        }
+    }
+}
+
+/// Limitador de banda compartilhável entre threads (`Clone + Send + Sync`) e atualizável em runtime.
+#[derive(Clone, Debug)]
+pub struct SharedBandwidthLimiter {
+    inner: std::sync::Arc<std::sync::Mutex<TokenBucket>>,
+}
+
+impl SharedBandwidthLimiter {
+    pub fn new(rate_kbps: u64) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(TokenBucket::new(rate_kbps))),
+        }
+    }
+
+    pub fn with_min_burst(rate_kbps: u64, min_burst: u64) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(TokenBucket::with_min_burst(rate_kbps, min_burst))),
+        }
+    }
+
+    pub fn rate_kbps(&self) -> u64 {
+        self.inner.lock().map(|b| b.rate_kbps()).unwrap_or(0)
+    }
+
+    pub fn is_unlimited(&self) -> bool {
+        self.rate_kbps() == 0
+    }
+
+    pub fn update_rate_kbps(&self, rate_kbps: u64) {
+        if let Ok(mut bucket) = self.inner.lock() {
+            bucket.update_rate_kbps(rate_kbps);
+        }
+    }
+
+    pub fn try_consume(&self, bytes: u64) -> bool {
+        self.inner.lock().map(|mut b| b.try_consume(bytes)).unwrap_or(true)
+    }
+
+    pub fn reserve(&self, bytes: u64) -> std::time::Duration {
+        self.inner.lock().map(|mut b| b.reserve(bytes)).unwrap_or(std::time::Duration::ZERO)
+    }
+}
+
 /// Configuração completa do nó Anarchord
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default)]
@@ -162,6 +345,7 @@ pub struct NodeConfig {
     pub mailbox: MailboxConfig,
     pub dm: DmPolicyConfig,
     pub firewall: FirewallConfig,
+    pub bandwidth: BandwidthConfig,
 }
 
 impl Default for NodeConfig {
@@ -172,6 +356,7 @@ impl Default for NodeConfig {
             mailbox: MailboxConfig::default(),
             dm: DmPolicyConfig::default(),
             firewall: FirewallConfig::default(),
+            bandwidth: BandwidthConfig::default(),
         }
     }
 }
@@ -270,6 +455,15 @@ impl NodeConfig {
     pub fn set_key(&mut self, key: &str, value: &str) -> Result<(), ConfigError> {
         let val = value.trim();
         match key.trim() {
+            "max_download_rate" | "bandwidth.max_download_rate" | "network.max_download_rate" => {
+                self.bandwidth.max_download_rate = parse_bandwidth_rate(val)?;
+            }
+            "max_upload_rate" | "bandwidth.max_upload_rate" | "network.max_upload_rate" => {
+                self.bandwidth.max_upload_rate = parse_bandwidth_rate(val)?;
+            }
+            "max_global_rate" | "bandwidth.max_global_rate" | "network.max_global_rate" => {
+                self.bandwidth.max_global_rate = parse_bandwidth_rate(val)?;
+            }
             "mailbox.enabled" => {
                 self.mailbox.enabled = match val {
                     "true" | "1" | "on" | "sim" => true,
@@ -549,5 +743,63 @@ mod tests {
         assert_eq!(parse_ttl_arg("300"), Some(300));
         assert_eq!(parse_ttl_arg("0"), None);
         assert_eq!(parse_ttl_arg("invalido"), None);
+    }
+
+    #[test]
+    fn test_node_config_backward_compat_without_bandwidth() {
+        let legacy_json = r#"{"version":1,"network":{"default_channel":"geral"}}"#;
+        let cfg: NodeConfig = serde_json::from_str(legacy_json).expect("JSON legado deve desserializar");
+        assert_eq!(cfg.bandwidth, BandwidthConfig::default());
+        assert_eq!(cfg.bandwidth.max_download_rate, 0);
+        assert_eq!(cfg.bandwidth.max_upload_rate, 0);
+        assert_eq!(cfg.bandwidth.max_global_rate, 0);
+    }
+
+    #[test]
+    fn test_parse_bandwidth_rate_and_set_key() {
+        assert_eq!(parse_bandwidth_rate("0").unwrap(), 0);
+        assert_eq!(parse_bandwidth_rate("ilimite").unwrap(), 0);
+        assert_eq!(parse_bandwidth_rate("ilimitado").unwrap(), 0);
+        assert_eq!(parse_bandwidth_rate("unlimited").unwrap(), 0);
+        assert_eq!(parse_bandwidth_rate("512").unwrap(), 512);
+        assert_eq!(parse_bandwidth_rate("500KB").unwrap(), 500);
+        assert_eq!(parse_bandwidth_rate("500kb/s").unwrap(), 500);
+        assert_eq!(parse_bandwidth_rate("2MB").unwrap(), 2048);
+        assert_eq!(parse_bandwidth_rate("2mb/s").unwrap(), 2048);
+        assert!(parse_bandwidth_rate("-10").is_err());
+        assert!(parse_bandwidth_rate("abc").is_err());
+
+        let mut cfg = NodeConfig::default();
+        cfg.set_key("max_download_rate", "500KB/s").unwrap();
+        cfg.set_key("bandwidth.max_upload_rate", "2MB").unwrap();
+        cfg.set_key("network.max_global_rate", "ilimitado").unwrap();
+        assert_eq!(cfg.bandwidth.max_download_rate, 500);
+        assert_eq!(cfg.bandwidth.max_upload_rate, 2048);
+        assert_eq!(cfg.bandwidth.max_global_rate, 0);
+    }
+
+    #[test]
+    fn test_token_bucket_unlimited_burst_depletion_refill_and_update() {
+        let mut unlimited = TokenBucket::new(0);
+        assert!(unlimited.is_unlimited());
+        assert!(unlimited.try_consume(10_000_000));
+        assert_eq!(unlimited.reserve(10_000_000), std::time::Duration::ZERO);
+
+        // 1 KB/s = 1024 B/s, mas min_burst garante capacidade mínima de 4096 B
+        let mut bucket = TokenBucket::with_min_burst(1, 4096);
+        assert!(bucket.try_consume(4096));
+        assert!(!bucket.try_consume(1));
+
+        let wait = bucket.reserve(1024);
+        assert!(wait >= std::time::Duration::from_millis(900));
+
+        // Atualização dinâmica para ilimitado e depois para 2 KB/s
+        bucket.update_rate_kbps(0);
+        assert!(bucket.is_unlimited());
+        assert!(bucket.try_consume(1_000_000));
+
+        bucket.update_rate_kbps(2);
+        assert_eq!(bucket.rate_kbps(), 2);
+        assert!(bucket.try_consume(4096));
     }
 }

@@ -35,6 +35,8 @@ pub const COMMANDS: &[&str] = &[
     "/rotate-key",
     "/firewall",
     "/config",
+    "/config show",
+    "/config set ",
     "/screen list",
     "/screen start",
     "/screen stop",

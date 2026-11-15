@@ -257,6 +257,9 @@ pub fn media_category_menu(ctx: &MenuContext) -> Menu {
 pub fn config_category_menu(ctx: &MenuContext) -> Menu {
     let mut items = vec![
         run("📋 Ver configurações atuais (/config show)", "/config show"),
+        ask("⬇️ Limite de download (max_download_rate)…", "Taxa em KB/s, 0 ou ilimite (ex.: 500KB/s, 0)", "/config set max_download_rate {}"),
+        ask("⬆️ Limite de upload (max_upload_rate)…", "Taxa em KB/s, 0 ou ilimite (ex.: 256KB/s, 0)", "/config set max_upload_rate {}"),
+        ask("🌐 Limite global de banda (max_global_rate)…", "Taxa em KB/s, 0 ou ilimite (ex.: 2MB/s, 0)", "/config set max_global_rate {}"),
         ask("✏️ Alterar configuração…", "Chave e valor (ex.: mailbox.max_message_ttl_days 14)", "/config set {}"),
         run("🛡️ Firewall e IPs bloqueados (/firewall)", "/firewall"),
     ];
@@ -601,6 +604,7 @@ pub const HELP_LINES: &[&str] = &[
     "  /friend add <pk|nick> [apelido]   /friend remove <pk|apelido>    /friends",
     "  /dm open <par>           /dm <par> <mensagem> [--ttl 2h|7d]",
     "  /config show             /config set <chave> <valor>",
+    "  /config set max_download_rate|max_upload_rate|max_global_rate <KB/s|0|ilimite>",
     "  /firewall                /firewall unblock <par>",
     "  /share <arquivo>         compartilha na sala atual (quem quiser baixa com /get)",
     "  /send <par> <arquivo>    /get <id>      /reject <id>      /files      /unshare <id>",
@@ -763,5 +767,36 @@ mod tests {
         assert_eq!(menu.selected, 1);
         menu.down();
         assert_eq!(menu.selected, 0);
+    }
+
+    #[test]
+    fn test_config_category_menu_bandwidth_items() {
+        let ctx = MenuContext {
+            in_server: false,
+            is_server_closed: false,
+            in_voice: false,
+            is_muted: false,
+            is_screen_sharing: false,
+            servers: &[],
+            access_requests: &[],
+            friends: &[],
+        };
+        let menu = config_category_menu(&ctx);
+        let dl = &menu.items[menu.find("max_download_rate").unwrap()];
+        let ul = &menu.items[menu.find("max_upload_rate").unwrap()];
+        let gl = &menu.items[menu.find("max_global_rate").unwrap()];
+
+        assert!(matches!(
+            &dl.action,
+            MenuAction::Ask { template, .. } if template == "/config set max_download_rate {}"
+        ));
+        assert!(matches!(
+            &ul.action,
+            MenuAction::Ask { template, .. } if template == "/config set max_upload_rate {}"
+        ));
+        assert!(matches!(
+            &gl.action,
+            MenuAction::Ask { template, .. } if template == "/config set max_global_rate {}"
+        ));
     }
 }

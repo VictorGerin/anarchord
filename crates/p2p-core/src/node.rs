@@ -3,9 +3,10 @@ use crate::identity::UserIdentity;
 use crate::protocol::AppBehaviour;
 use libp2p::{
     autonat, dcutr, gossipsub, identify, kad::{self, store::MemoryStore},
-    multiaddr::Protocol, noise, ping, swarm::Swarm, tcp, yamux, Multiaddr, PeerId, SwarmBuilder,
+    multiaddr::Protocol, noise, ping, swarm::Swarm, tcp, yamux, Multiaddr, PeerId, SwarmBuilder, Transport,
 };
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::net::{TcpListener, UdpSocket};
 use std::time::Duration;
 use thiserror::Error;
@@ -133,6 +134,8 @@ pub struct NodeOptions {
     pub validate_messages: bool,
     /// Controlador de acesso ao servidor Circuit Relay v2 integrado ao `NodeFirewall` e lista de amigos
     pub relay_access: Option<crate::firewall::RelayAccessControl>,
+    /// Limitador global de banda (ingress + egress) compartilhado em runtime (None = ilimitado)
+    pub global_limiter: Option<crate::config::SharedBandwidthLimiter>,
 }
 
 impl Default for NodeOptions {
@@ -146,6 +149,7 @@ impl Default for NodeOptions {
             capabilities: None,
             validate_messages: false,
             relay_access: None,
+            global_limiter: None,
         }
     }
 }
@@ -164,15 +168,29 @@ impl P2PNode {
         let dns_config = libp2p::dns::ResolverConfig::cloudflare();
         let dns_opts = libp2p::dns::ResolverOpts::default();
 
+        let global_limiter = options.global_limiter.clone();
+
         let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
             .with_tokio()
-            .with_tcp(
-                tcp::Config::default(),
-                noise::Config::new,
-                yamux::Config::default,
-            )
+            .with_other_transport(move |key| {
+                let tcp_transport = tcp::tokio::Transport::new(tcp::Config::default())
+                    .upgrade(libp2p::core::upgrade::Version::V1Lazy)
+                    .authenticate(noise::Config::new(key)?)
+                    .multiplex(yamux::Config::default())
+                    .boxed();
+                let quic_transport = libp2p::quic::tokio::Transport::new(libp2p::quic::Config::new(key))
+                    .map(|(peer_id, muxer), _| (peer_id, libp2p::core::muxing::StreamMuxerBox::new(muxer)))
+                    .boxed();
+                let combined = tcp_transport
+                    .or_transport(quic_transport)
+                    .map(|either, _| match either {
+                        futures::future::Either::Left(v) => v,
+                        futures::future::Either::Right(v) => v,
+                    })
+                    .boxed();
+                Ok(BandwidthTransport::new(combined, global_limiter))
+            })
             .map_err(|e| NodeError::SwarmInit(e.to_string()))?
-            .with_quic()
             .with_dns_config(dns_config, dns_opts)
             .with_relay_client(noise::Config::new, yamux::Config::default)
             .map_err(|e| NodeError::SwarmInit(e.to_string()))?
@@ -410,6 +428,193 @@ impl P2PNode {
     }
 }
 
+/// Wrapper de transporte libp2p que aplica `SharedBandwidthLimiter` a todos os substreams
+/// (ingress e egress) sem isentar nenhum protocolo (Ping, Identify, Kademlia, Gossipsub, Files, Relay).
+struct BandwidthTransport<T> {
+    inner: T,
+    limiter: Option<crate::config::SharedBandwidthLimiter>,
+}
+
+impl<T> BandwidthTransport<T> {
+    fn new(inner: T, limiter: Option<crate::config::SharedBandwidthLimiter>) -> Self {
+        Self { inner, limiter }
+    }
+}
+
+impl<T, M> libp2p::Transport for BandwidthTransport<T>
+where
+    T: libp2p::Transport<Output = (PeerId, M)> + Unpin,
+    M: libp2p::core::muxing::StreamMuxer + Send + Unpin + 'static,
+    M::Substream: Send + Unpin + 'static,
+    M::Error: Send + Sync + 'static,
+    T::Dial: Send + 'static,
+    T::ListenerUpgrade: Send + 'static,
+{
+    type Output = (PeerId, libp2p::core::muxing::StreamMuxerBox);
+    type Error = T::Error;
+    type Dial = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Output, Self::Error>> + Send>>;
+    type ListenerUpgrade = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Output, Self::Error>> + Send>>;
+
+    fn listen_on(&mut self, id: libp2p::core::transport::ListenerId, addr: Multiaddr) -> Result<(), libp2p::TransportError<Self::Error>> {
+        self.inner.listen_on(id, addr)
+    }
+
+    fn remove_listener(&mut self, id: libp2p::core::transport::ListenerId) -> bool {
+        self.inner.remove_listener(id)
+    }
+
+    fn dial(&mut self, addr: Multiaddr, opts: libp2p::core::transport::DialOpts) -> Result<Self::Dial, libp2p::TransportError<Self::Error>> {
+        let fut = self.inner.dial(addr, opts)?;
+        let limiter = self.limiter.clone();
+        Ok(Box::pin(async move {
+            let (peer_id, muxer) = fut.await?;
+            Ok((peer_id, libp2p::core::muxing::StreamMuxerBox::new(BandwidthMuxer { inner: muxer, limiter })))
+        }))
+    }
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<libp2p::core::transport::TransportEvent<Self::ListenerUpgrade, Self::Error>> {
+        match std::pin::Pin::new(&mut self.inner).poll(cx) {
+            std::task::Poll::Ready(ev) => std::task::Poll::Ready(ev.map_upgrade(|fut| {
+                let limiter = self.limiter.clone();
+                Box::pin(async move {
+                    let (peer_id, muxer) = fut.await?;
+                    Ok((peer_id, libp2p::core::muxing::StreamMuxerBox::new(BandwidthMuxer { inner: muxer, limiter })))
+                }) as Self::ListenerUpgrade
+            })),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+struct BandwidthMuxer<M> {
+    inner: M,
+    limiter: Option<crate::config::SharedBandwidthLimiter>,
+}
+
+impl<M: libp2p::core::muxing::StreamMuxer + Unpin> libp2p::core::muxing::StreamMuxer for BandwidthMuxer<M>
+where
+    M::Substream: Unpin,
+{
+    type Substream = BandwidthSubstream<M::Substream>;
+    type Error = M::Error;
+
+    fn poll_inbound(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Self::Substream, Self::Error>> {
+        std::pin::Pin::new(&mut self.inner)
+            .poll_inbound(cx)
+            .map_ok(|s| BandwidthSubstream::new(s, self.limiter.clone()))
+    }
+
+    fn poll_outbound(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Self::Substream, Self::Error>> {
+        std::pin::Pin::new(&mut self.inner)
+            .poll_outbound(cx)
+            .map_ok(|s| BandwidthSubstream::new(s, self.limiter.clone()))
+    }
+
+    fn poll_close(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        std::pin::Pin::new(&mut self.inner).poll_close(cx)
+    }
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<libp2p::core::muxing::StreamMuxerEvent, Self::Error>> {
+        std::pin::Pin::new(&mut self.inner).poll(cx)
+    }
+}
+
+struct BandwidthSubstream<S> {
+    inner: S,
+    limiter: Option<crate::config::SharedBandwidthLimiter>,
+    read_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    write_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S> BandwidthSubstream<S> {
+    fn new(inner: S, limiter: Option<crate::config::SharedBandwidthLimiter>) -> Self {
+        Self {
+            inner,
+            limiter,
+            read_sleep: None,
+            write_sleep: None,
+        }
+    }
+}
+
+impl<S: futures::io::AsyncRead + Unpin> futures::io::AsyncRead for BandwidthSubstream<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if let Some(sleep) = self.read_sleep.as_mut() {
+            match sleep.as_mut().poll(cx) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(()) => self.read_sleep = None,
+            }
+        }
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &poll {
+            if *n > 0 {
+                if let Some(limiter) = &self.limiter {
+                    let delay = limiter.reserve(*n as u64);
+                    if !delay.is_zero() {
+                        let mut sleep = Box::pin(tokio::time::sleep(delay));
+                        let _ = sleep.as_mut().poll(cx);
+                        self.read_sleep = Some(sleep);
+                    }
+                }
+            }
+        }
+        poll
+    }
+}
+
+impl<S: futures::io::AsyncWrite + Unpin> futures::io::AsyncWrite for BandwidthSubstream<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if let Some(sleep) = self.write_sleep.as_mut() {
+            match sleep.as_mut().poll(cx) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(()) => self.write_sleep = None,
+            }
+        }
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &poll {
+            if *n > 0 {
+                if let Some(limiter) = &self.limiter {
+                    let delay = limiter.reserve(*n as u64);
+                    if !delay.is_zero() {
+                        let mut sleep = Box::pin(tokio::time::sleep(delay));
+                        let _ = sleep.as_mut().poll(cx);
+                        self.write_sleep = Some(sleep);
+                    }
+                }
+            }
+        }
+        poll
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_close(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,5 +674,27 @@ mod tests {
         let v6: Multiaddr = format!("/ip6/{}/tcp/{}", "::1", 7000).parse().unwrap();
         assert_eq!(v4.to_string(), "/ip4/127.0.0.1/tcp/7000");
         assert_eq!(v6.to_string(), "/ip6/::1/tcp/7000");
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth_substream_unlimited_and_hot_reload() {
+        use futures::io::{AsyncReadExt, AsyncWriteExt};
+
+        let limiter = crate::config::SharedBandwidthLimiter::with_min_burst(0, 1024);
+        let payload = vec![0xABu8; 4096];
+
+        let mut writer = BandwidthSubstream::new(futures::io::Cursor::new(Vec::new()), Some(limiter.clone()));
+        writer.write_all(&payload).await.unwrap();
+        writer.flush().await.unwrap();
+        assert!(limiter.is_unlimited());
+
+        // Ativa limite em runtime (hot-reload) e valida que o próximo consumo gera atraso quando excede o burst
+        limiter.update_rate_kbps(1); // 1024 B/s
+        assert!(!limiter.is_unlimited());
+        let mut reader = BandwidthSubstream::new(futures::io::Cursor::new(payload.clone()), Some(limiter.clone()));
+        let mut buf = vec![0u8; 4096];
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(n, 4096);
+        assert!(reader.read_sleep.is_some(), "leitura acima do burst deve agendar backpressure");
     }
 }

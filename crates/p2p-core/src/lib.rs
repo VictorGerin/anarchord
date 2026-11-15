@@ -24,7 +24,7 @@ pub use identity::{
     safety_number, EncryptionKeyAdvertisement, FriendEntry, FriendState, IdentityKeys, KeyPairInfo,
     SignedEncryptionKeyAdvertisement, UserIdentity,
 };
-pub use config::{FirewallConfig, NodeConfig};
+pub use config::{BandwidthConfig, FirewallConfig, NodeConfig, SharedBandwidthLimiter, TokenBucket};
 pub use firewall::{
     FirewallBlockEntry, FirewallCategory, FirewallVerdict, NodeFirewall, RelayAccessControl,
 };

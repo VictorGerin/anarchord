@@ -275,6 +275,10 @@ pub(crate) struct Runtime {
     stamp_rx: Option<UnboundedReceiver<servers::StampResult>>,
     /// Provas de trabalho de pedidos de acesso calculadas em threads
     pow_tx: UnboundedSender<access::PowResult>,
+    /// Limitadores de banda compartilháveis (download/upload de arquivos e global)
+    download_limiter: crate::config::SharedBandwidthLimiter,
+    upload_limiter: crate::config::SharedBandwidthLimiter,
+    global_limiter: crate::config::SharedBandwidthLimiter,
     pow_rx: Option<UnboundedReceiver<access::PowResult>>,
     /// Pedidos de acesso: inscrições, pendentes e esperas (#91)
     access: access::AccessState,
@@ -297,6 +301,7 @@ impl Runtime {
             .unwrap_or_else(crate::wire::ProtocolCapabilities::local);
         let now = now_secs();
         let dm = dm::DmState::new(config.config_path.clone(), Some(config.servers_dir.join("mailbox.json")), now);
+        let global_limiter = crate::config::SharedBandwidthLimiter::new(dm.node_config.bandwidth.max_global_rate);
         let relay_access = dm.firewall.relay_access();
         relay_access.set_friends_only(dm.node_config.firewall.relay_friends_only);
         relay_access.update_friends(identity.get_friends().iter().map(|f| f.public_key.clone()));
@@ -311,6 +316,7 @@ impl Runtime {
                 capabilities: Some(local_capabilities.clone()),
                 validate_messages: true,
                 relay_access: Some(relay_access),
+                global_limiter: Some(global_limiter.clone()),
             },
         )?;
         let mut relay_manager = RelayManager::new();
@@ -320,7 +326,15 @@ impl Runtime {
         let active = ActiveChannel::new(Space::Lobby, config.channel.clone());
         node.swarm.behaviour_mut().gossipsub.subscribe(&active.topic).map_err(|e| CoreStartError::Subscribe(format!("{:?}", e)))?;
         let screen = screen::ScreenState::new(&mut node);
-        let files = files::FilesState::new(&identity, config.download_dir.clone());
+        let download_limiter = crate::config::SharedBandwidthLimiter::with_min_burst(
+            dm.node_config.bandwidth.max_download_rate,
+            crate::files::PIECE_SIZE as u64,
+        );
+        let upload_limiter = crate::config::SharedBandwidthLimiter::with_min_burst(
+            dm.node_config.bandwidth.max_upload_rate,
+            crate::files::PIECE_SIZE as u64,
+        );
+        let files = files::FilesState::new(&identity, config.download_dir.clone(), download_limiter.clone(), upload_limiter.clone());
         let (stamp_tx, stamp_rx) = unbounded_channel();
         let (pow_tx, pow_rx) = unbounded_channel();
         Ok(Self {
@@ -363,6 +377,9 @@ impl Runtime {
             stamp_rx: Some(stamp_rx),
             pow_tx,
             pow_rx: Some(pow_rx),
+            download_limiter,
+            upload_limiter,
+            global_limiter,
             access: access::AccessState::default(),
             last_leader: HashMap::new(),
             voice: voice::VoiceState::default(),
@@ -375,6 +392,14 @@ impl Runtime {
 
     fn emit(&self, event: CoreEvent) {
         let _ = self.events.send(event);
+    }
+
+    /// Atualiza os limitadores de banda em memória a partir de `self.dm.node_config.bandwidth`
+    pub(super) fn sync_bandwidth_limiters(&self) {
+        let bw = &self.dm.node_config.bandwidth;
+        self.download_limiter.update_rate_kbps(bw.max_download_rate);
+        self.upload_limiter.update_rate_kbps(bw.max_upload_rate);
+        self.global_limiter.update_rate_kbps(bw.max_global_rate);
     }
 
     fn error(&self, error: CoreError) {
@@ -557,7 +582,10 @@ impl Runtime {
             CoreCommand::OpenDm { target } => self.open_dm(&target),
             CoreCommand::SendDm { target, text, suggested_ttl } => self.send_dm(&target, &text, suggested_ttl),
             CoreCommand::ShowConfig => self.show_config(),
-            CoreCommand::SetConfig { key, value } => self.set_config(&key, &value),
+            CoreCommand::SetConfig { key, value } => {
+                self.set_config(&key, &value);
+                self.sync_bandwidth_limiters();
+            }
             CoreCommand::ListFirewall => self.list_firewall(),
             CoreCommand::UnblockPeer { target } => self.unblock_peer(&target),
             CoreCommand::Server(command) => self.run_server_command(command),
